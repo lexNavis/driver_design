@@ -1,0 +1,17 @@
+# Non source files
+.*
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.o
+*.order
+*.symvers
+
+# Useless folders
+.cache/
+.vscode/ 
+
+# Keep gitignore
+!.gitignore
+!.gitattributes
