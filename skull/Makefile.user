@@ -1,0 +1,13 @@
+all: producer consumer flusher
+
+producer: producer.c
+	gcc producer.c -o producer
+
+consumer: consumer.c
+	gcc consumer.c -o consumer
+
+flusher: flusher.c
+	gcc flusher.c -o flusher
+
+clean:
+	rm -f producer consumer flusher
