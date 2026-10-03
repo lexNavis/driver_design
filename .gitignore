@@ -1,17 +1,25 @@
-# Non source files
-.*
+# Kernel build artifacts
 *.ko
+*.o
 *.mod
 *.mod.c
 *.mod.o
-*.o
 *.order
 *.symvers
+*.cmd
+.tmp_versions/
+Module.symvers
 
-# Useless folders
-.cache/
-.vscode/ 
+# Userspace binaries
+producer
+consumer
+flusher
 
-# Keep gitignore
+# Logs
+logs/
+
+# Dotfiles
+.*
 !.gitignore
 !.gitattributes
+!.vscode/
