@@ -14,12 +14,14 @@ Module.symvers
 producer
 consumer
 flusher
+af_packet
 
-# Logs
+# Service folders
 logs/
+.vscode/
 
 # Dotfiles
 .*
 !.gitignore
 !.gitattributes
-!.vscode/
+
