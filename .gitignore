@@ -15,12 +15,15 @@ producer
 consumer
 flusher
 af_packet
+rng_test
+test_ioctl
 
 # Service folders
 logs/
 .vscode/
 
 # Dotfiles
+*.txt
 .*
 !.gitignore
 !.gitattributes
