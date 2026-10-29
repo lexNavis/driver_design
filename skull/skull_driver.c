@@ -174,13 +174,14 @@ static ssize_t skull_read(struct file *filp, char __user *buf, size_t size, loff
   size_t str_size = 0;
   struct skull_dev *dev = filp->private_data;
   int dev_idx = dev - devs;
+  printk(KERN_INFO "skull_read (dev[%d]): Request to read\n", dev_idx);
   /* Check is flushing is active  */
   if (atomic_read(&dev->is_flushing))
   {
     /* Wait until flusher ends his work  */
     if (wait_event_interruptible(dev->flush_wq, !atomic_read(&dev->is_flushing)))
     {
-      printk(KERN_ERR "skull_read: woke by signal\n");
+      printk(KERN_ERR "skull_read (dev[%d]): woke by signal\n", dev_idx);
       return -ERESTARTSYS;
     }
   }
@@ -188,7 +189,7 @@ static ssize_t skull_read(struct file *filp, char __user *buf, size_t size, loff
   if (down_interruptible(&dev->full))
   {
     err = -ERESTARTSYS;
-    printk(KERN_ERR "skull_read: Process woke up by signal. Leaving read request\n");
+    printk(KERN_ERR "skull_read (dev[%d]): Process woke up by signal. Leaving read request\n", dev_idx);
     goto out;
   }
   /* Start of stack critical section */
@@ -199,7 +200,7 @@ static ssize_t skull_read(struct file *filp, char __user *buf, size_t size, loff
   if (size < str_size)
   {
     err = -EINVAL;
-    printk(KERN_ERR "skull_read: Buffer has less space, than needed. Cancel extracting\n");
+    printk(KERN_ERR "skull_read (dev[%d]): Buffer has less space, than needed. Cancel extracting\n", dev_idx);
     goto leave_without;
   }
   dev->size--;
@@ -215,7 +216,7 @@ static ssize_t skull_read(struct file *filp, char __user *buf, size_t size, loff
   if (bytes_missed > 0)
   {
     err = -EFAULT;
-    printk(KERN_INFO "skull_read: copy_to_user failed\n");
+    printk(KERN_ERR "skull_read (dev[%d]): copy_to_user failed\n", dev_idx);
     goto out;
   }
   return str_size;
@@ -231,21 +232,22 @@ static ssize_t skull_write(struct file *filp, const char __user *buf, size_t siz
 {
   ssize_t err = 0;
   char *str = kmalloc(size, GFP_KERNEL);
+  struct skull_dev *dev = filp->private_data;
+  int dev_idx = dev - devs;
   if (!str)
   {
     err = -ENOMEM;
-    printk(KERN_ERR "skull_write: kmalloc failed\n");
+    printk(KERN_ERR "skull_write (dev[%d]): kmalloc failed\n", dev_idx);
     goto out;
   }
   unsigned long bytes_missed = copy_from_user(str, buf, size);
   if (bytes_missed > 0)
   {
     err = -EFAULT;
-    printk(KERN_ERR "skull_write: copy_from_user failed\n");
+    printk(KERN_ERR "skull_write (dev[%d]): copy_from_user failed\n", dev_idx);
     goto out;
   }
-  struct skull_dev *dev = filp->private_data;
-  int dev_idx = dev - devs;
+  printk(KERN_INFO "skull_write (dev[%d]): Request to write\n", dev_idx);
   /* Check if flusher is active */
   if (atomic_read(&dev->is_flushing))
   {
@@ -253,13 +255,13 @@ static ssize_t skull_write(struct file *filp, const char __user *buf, size_t siz
     if (wait_event_interruptible(dev->flush_wq, !atomic_read(&dev->is_flushing)))
     {
       err = -ERESTARTSYS;
-      goto out; /* out делает kfree(str) */
+      goto out;
     }
   }
   /* Start of producer - consumer critical section */
   if (down_interruptible(&dev->empty))
   {
-    printk(KERN_ERR "skull_write: Process woke up by signal. Leaving write request\n");
+    printk(KERN_ERR "skull_write (dev[%d]): Process woke up by signal. Leaving write request\n", dev_idx);
     err = -ERESTARTSYS;
     goto out;
   }
