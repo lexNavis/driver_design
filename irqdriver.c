@@ -9,7 +9,7 @@
 #include <linux/delay.h>
 #include <linux/pci.h>
 #include <linux/io.h>
-
+#include <linux/ktime.h> // Для работы с ktime_t
 
 #define CLOCK_INTERVAL 100000000
 
@@ -24,11 +24,22 @@ static struct irq_tasklet_data {
 	struct tasklet_struct tasklet;
 	/* 0 - timer, 1 - edu */
 	int src;	
+	/* Time measurement */
+	ktime_t start_time;
+	u64 total_lag;
 }tasklet_data;
+
 static struct irq_workqueue_data {
 	struct work_struct work;
 	int src;	
+	/* Time measurement */
+	ktime_t start_time;
+	u64 total_lag;
 }workqueue_data;
+
+/* Thread time measurement */
+static ktime_t thread_start_time;
+static u64 thread_total_lag = 0;
 
 /* Counters. Save information, how many
  * interrupts have entered top-half and bottom-half
@@ -149,11 +160,27 @@ int show_stats(struct seq_file *file, void *) {
 	seq_printf(file, "hrtimer handled %d irqs\n", atomic_read(&timer_count));
 	seq_printf(file, "edu handled %d irqs\n", atomic_read(&edu_count));
 	seq_printf(file, "------SOFTIRQS------\n");
-	seq_printf(file, "tasklet handled %d irqs from timer\n", atomic_read(&timer_tasklet_count));
-	seq_printf(file, "tasklet handled %d irqs from edu\n", atomic_read(&edu_tasklet_count));
-	seq_printf(file, "workqueue handled %d irqs from timer\n", atomic_read(&timer_workqueue_count));
-	seq_printf(file, "workqueue handled %d irqs from edu\n", atomic_read(&edu_workqueue_count));
-	seq_printf(file, "threaded_irq handled %d irqs\n", atomic_read(&threaded_irq_count));
+	
+	int t_count = atomic_read(&timer_tasklet_count);
+	int e_count = atomic_read(&edu_tasklet_count);
+	seq_printf(file, "tasklet handled %d irqs from timer\n", t_count);
+	seq_printf(file, "tasklet handled %d irqs from edu\n", e_count);
+	/* Average lag in nanoseconds */
+	u64 avg_t_lag = t_count ? (tasklet_data.total_lag / t_count) : 0;
+	seq_printf(file, "tasklet avg lag: %llu ns\n", avg_t_lag);
+
+	int wt_count = atomic_read(&timer_workqueue_count);
+	int we_count = atomic_read(&edu_workqueue_count);
+	seq_printf(file, "workqueue handled %d irqs from timer\n", wt_count);
+	seq_printf(file, "workqueue handled %d irqs from edu\n", we_count);
+	u64 avg_w_lag = wt_count ? (workqueue_data.total_lag / wt_count) : 0;
+	seq_printf(file, "workqueue avg lag: %llu ns\n", avg_w_lag);
+
+	int th_count = atomic_read(&threaded_irq_count);
+	seq_printf(file, "threaded_irq handled %d irqs\n", th_count);
+	u64 avg_th_lag = th_count ? (thread_total_lag / th_count) : 0;
+	seq_printf(file, "threaded_irq avg lag: %llu ns\n", avg_th_lag);
+	
 	return 0;
 }
 
@@ -167,6 +194,10 @@ void timer_workqueue_callback(struct work_struct *work)
 	if (!w_data) {
 		return;
 	}
+	/* Calculate lag */
+	u64 lag = ktime_to_ns(ktime_sub(ktime_get(), w_data->start_time));
+	w_data->total_lag += lag;
+	
 	if (w_data->src)
 		atomic_inc(&edu_workqueue_count);
 	else
@@ -184,6 +215,10 @@ void timer_tasklet_callback(unsigned long data)
 	if (!t_data) {
 		return;
 	}
+	/* Calculate lag */
+	u64 lag = ktime_to_ns(ktime_sub(ktime_get(), t_data->start_time));
+	t_data->total_lag += lag;
+	
 	if (t_data->src)
 		atomic_inc(&edu_tasklet_count);	
 	else
@@ -198,6 +233,11 @@ enum hrtimer_restart timer_callback(struct hrtimer *timer)
 	atomic_inc(&timer_count);
 	/* Replan the timer */
 	hrtimer_forward(timer, ktime_get(), ktime_set(0, CLOCK_INTERVAL));
+	
+	/* Save start time before scheduling */
+	tasklet_data.start_time = ktime_get();
+	workqueue_data.start_time = ktime_get();
+	
 	/* Plan tasklet */
 	tasklet_data.src = 0;
 	tasklet_schedule(&tasklet_data.tasklet);
@@ -221,6 +261,12 @@ irqreturn_t edu_irq_top_half(int irq, void *dev_id)
 	/* Accept irq */
 	iowrite32(status, edu_base + EDU_REG_ACK_IRQ);
 	atomic_inc(&edu_count);
+	
+	/* Save start time before scheduling */
+	tasklet_data.start_time = ktime_get();
+	workqueue_data.start_time = ktime_get();
+	thread_start_time = ktime_get();
+	
 	/* Plan bottom-half */
 	tasklet_data.src = 1;
 	tasklet_schedule(&tasklet_data.tasklet);
@@ -230,6 +276,9 @@ irqreturn_t edu_irq_top_half(int irq, void *dev_id)
 }
 irqreturn_t edu_irq_thread(int irq, void *dev_id)
 {
+	u64 lag = ktime_to_ns(ktime_sub(ktime_get(), thread_start_time));
+	thread_total_lag += lag;
+	
 	atomic_inc(&threaded_irq_count);
 	/* Irq complete */
 	return IRQ_HANDLED;
