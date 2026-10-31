@@ -7,6 +7,7 @@
 #include <linux/seq_file.h>
 #include <linux/workqueue.h>
 #include <linux/delay.h>
+#include <linux/pci.h>
 
 
 #define CLOCK_INTERVAL 100000000
@@ -20,6 +21,8 @@ static atomic_t timer_count = ATOMIC_INIT(0);
 static atomic_t tasklet_count = ATOMIC_INIT(0);
 /* workqueue irqs */
 static atomic_t workqueue_count = ATOMIC_INIT(0);
+/* Ptr to PCI edu device */
+static struct pci_dev *edu_dev = NULL; 
 /* Pointer to file in /proc directory */
 struct proc_dir_entry *proc;
 /* Create a timer var */
@@ -43,9 +46,24 @@ static int __init irqdriver_init(void)
 	 * Create file in root dir, so parent is NULL */
 	proc = proc_create_single("irqdriver", 0, NULL, show_stats);
 	if (!proc) {
-		printk(KERN_ERR "proc_create failed, returned NULL\n");
+		printk(KERN_ERR "irqdriver: proc_create failed, returned NULL\n");
 		return -ENOMEM;
 	}
+	/* Find PCI device and its IRQ number by
+	 * Vendor ID and Device ID
+	 * NULL says start from the beginning of dev list */
+	edu_dev = pci_get_device(0x1234, 0x11e8, NULL);
+	if (!edu_dev){
+		printk(KERN_ERR "irqdriver: edu device not found, returned NULL\n");		
+		return -ENODEV;
+	}
+	/* Turn it on */
+	if (pci_enable_device(edu_dev)){
+		printk(KERN_ERR "irqdriver: failed to enable PCI device\n");
+		return -EIO;
+	}
+	/* If found, print its IRQ num */
+	printk(KERN_INFO "Edu device IRQ is %d\n", edu_dev->irq);
 	/* Initialize global variables */
 	tasklet_init(&timer_tasklet, timer_tasklet_callback, 0);
 	INIT_WORK(&gwork, timer_workqueue_callback);
@@ -66,6 +84,8 @@ static void __exit irqdriver_exit(void)
 	cancel_work_sync(&gwork);
 	/* Delete /proc file */
 	remove_proc_entry("irqdriver", NULL);
+	/* Remove edu */
+	pci_dev_put(edu_dev);
 }
 /* Prints statistics of handled soft/hardirqs */
 int show_stats(struct seq_file *file, void *) {
