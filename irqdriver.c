@@ -13,12 +13,14 @@
  */
 static atomic_t timer_count = ATOMIC_INIT(0);
 static atomic_t tasklet_count = ATOMIC_INIT(0);
-
-
+/* Pointer to file in /proc directory */
+struct proc_dir_entry *proc;
 /* Create a timer var */
 static struct hrtimer timer;
 /* Create global tasklet variable */
 static struct tasklet_struct timer_tasklet;  
+/* Stats function */
+static int show_stats(struct seq_file *file, void *);
 /* Callbacks definition */
 static void timer_tasklet_callback(unsigned long);
 enum hrtimer_restart timer_callback(struct hrtimer *timer);
@@ -26,6 +28,14 @@ enum hrtimer_restart timer_callback(struct hrtimer *timer);
 static int __init irqdriver_init(void)
 {
 	printk(KERN_INFO "irqdriver: Module mounted!\n");
+	/* Assign ptr to an opened file
+	 * 0 stands for 0444 - read-only
+	 * Create file in root dir, so parent is NULL */
+	proc = proc_create_single("irqdriver", 0, NULL, show_stats);
+	if (!proc) {
+		printk(KERN_ERR "proc_create failed, returned NULL\n");
+		return -ENOMEM;
+	}
 	/* Initialize global variables */
 	tasklet_init(&timer_tasklet, timer_tasklet_callback, 0);
 	hrtimer_init(&timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
@@ -41,7 +51,18 @@ static void __exit irqdriver_exit(void)
 	hrtimer_cancel(&timer);
 	/* Free tasklet */
 	tasklet_kill(&timer_tasklet);
+	/* Delete /proc file */
+	remove_proc_entry("irqdriver", NULL);
 }
+/* Prints statistics of handled soft/hardirqs */
+int show_stats(struct seq_file *file, void *) {
+	seq_printf(file, "------HARDIRQS------\n");
+	seq_printf(file, "hrtimer handled %d irqs\n", atomic_read(&timer_count));
+	seq_printf(file, "------SOFTIRQS------\n");
+	seq_printf(file, "tasklet handled %d irqs\n", atomic_read(&tasklet_count));
+	return 0;
+}
+
 void timer_tasklet_callback(unsigned long)
 {
 	/* Inc bottom-half tasklet counter */
