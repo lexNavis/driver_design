@@ -5,24 +5,33 @@
 #include <linux/interrupt.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/workqueue.h>
+
 
 #define CLOCK_INTERVAL 100000000
 
 /* Counters. Save information, how many
  * interrupts have entered top-half and bottom-half
  */
+/* hrtimer irqs */
 static atomic_t timer_count = ATOMIC_INIT(0);
+/* tasklet irqs*/
 static atomic_t tasklet_count = ATOMIC_INIT(0);
+/* workqueue irqs */
+static atomic_t workqueue_count = ATOMIC_INIT(0);
 /* Pointer to file in /proc directory */
 struct proc_dir_entry *proc;
 /* Create a timer var */
-static struct hrtimer timer;
+static struct hrtimer gtimer;
 /* Create global tasklet variable */
 static struct tasklet_struct timer_tasklet;  
+/* Workqueue structure */
+struct work_struct gwork;
 /* Stats function */
 static int show_stats(struct seq_file *file, void *);
 /* Callbacks definition */
 static void timer_tasklet_callback(unsigned long);
+static void timer_workqueue_callback(struct work_struct *work);
 enum hrtimer_restart timer_callback(struct hrtimer *timer);
 
 static int __init irqdriver_init(void)
@@ -38,19 +47,22 @@ static int __init irqdriver_init(void)
 	}
 	/* Initialize global variables */
 	tasklet_init(&timer_tasklet, timer_tasklet_callback, 0);
-	hrtimer_init(&timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	INIT_WORK(&gwork, timer_workqueue_callback);
+	hrtimer_init(&gtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	/* Register top-half callback */
-	timer.function = timer_callback;
-	hrtimer_start(&timer, ktime_set(0, CLOCK_INTERVAL), HRTIMER_MODE_REL);
+	gtimer.function = timer_callback;
+	hrtimer_start(&gtimer, ktime_set(0, CLOCK_INTERVAL), HRTIMER_MODE_REL);
 	return 0;
 }
 static void __exit irqdriver_exit(void)
 {
 	printk(KERN_INFO "irqdriver: Module unmounted!\n");
 	/* Stop timer */
-	hrtimer_cancel(&timer);
+	hrtimer_cancel(&gtimer);
 	/* Free tasklet */
 	tasklet_kill(&timer_tasklet);
+	/* Free workqueue */
+	cancel_work_sync(&gwork);
 	/* Delete /proc file */
 	remove_proc_entry("irqdriver", NULL);
 }
@@ -60,8 +72,16 @@ int show_stats(struct seq_file *file, void *) {
 	seq_printf(file, "hrtimer handled %d irqs\n", atomic_read(&timer_count));
 	seq_printf(file, "------SOFTIRQS------\n");
 	seq_printf(file, "tasklet handled %d irqs\n", atomic_read(&tasklet_count));
+	seq_printf(file, "workqueue handled %d irqs\n", atomic_read(&workqueue_count));
 	return 0;
 }
+
+void timer_workqueue_callback(struct work_struct *work)
+{
+	/* Inc bottom-half workqueue counter */
+	atomic_inc(&workqueue_count);
+}
+
 
 void timer_tasklet_callback(unsigned long)
 {
@@ -79,6 +99,9 @@ enum hrtimer_restart timer_callback(struct hrtimer *timer)
 	hrtimer_forward(timer, ktime_get(), ktime_set(0, CLOCK_INTERVAL));
 	/* Plan softirq */
 	tasklet_schedule(&timer_tasklet);
+	/* Plan workqueue
+	 * Add gwork to list of planned actions */
+	queue_work(system_wq, &gwork);
 	return HRTIMER_RESTART;
 }
 
