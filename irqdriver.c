@@ -6,6 +6,7 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/workqueue.h>
+#include <linux/delay.h>
 
 
 #define CLOCK_INTERVAL 100000000
@@ -32,7 +33,7 @@ static int show_stats(struct seq_file *file, void *);
 /* Callbacks definition */
 static void timer_tasklet_callback(unsigned long);
 static void timer_workqueue_callback(struct work_struct *work);
-enum hrtimer_restart timer_callback(struct hrtimer *timer);
+static enum hrtimer_restart timer_callback(struct hrtimer *timer);
 
 static int __init irqdriver_init(void)
 {
@@ -78,6 +79,8 @@ int show_stats(struct seq_file *file, void *) {
 
 void timer_workqueue_callback(struct work_struct *work)
 {
+	/* We are not in irq context, so
+	 * sleeping is allowed */
 	/* Inc bottom-half workqueue counter */
 	atomic_inc(&workqueue_count);
 }
@@ -85,6 +88,8 @@ void timer_workqueue_callback(struct work_struct *work)
 
 void timer_tasklet_callback(unsigned long)
 {
+	/* msleep test. tasklet works in irq context,
+	 * so we mustnt sleep here. */
 	/* Inc bottom-half tasklet counter */
 	atomic_inc(&tasklet_count);	
 }
