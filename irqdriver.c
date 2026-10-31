@@ -18,6 +18,17 @@
 #define EDU_REG_ACK_IRQ		0x64
 #define EDU_REG_IRQ_STATUS	0x24
 
+/* To distinguish irq source, 
+ * create structs for tasklet and workqueue */
+static struct irq_tasklet_data {
+	struct tasklet_struct tasklet;
+	/* 0 - timer, 1 - edu */
+	int src;	
+}tasklet_data;
+static struct irq_workqueue_data {
+	struct work_struct work;
+	int src;	
+}workqueue_data;
 
 /* Counters. Save information, how many
  * interrupts have entered top-half and bottom-half
@@ -27,9 +38,11 @@ static atomic_t timer_count = ATOMIC_INIT(0);
 /* edu irqs */
 static atomic_t edu_count = ATOMIC_INIT(0);
 /* tasklet irqs*/
-static atomic_t tasklet_count = ATOMIC_INIT(0);
+static atomic_t timer_tasklet_count = ATOMIC_INIT(0);
+static atomic_t edu_tasklet_count = ATOMIC_INIT(0);
 /* workqueue irqs */
-static atomic_t workqueue_count = ATOMIC_INIT(0);
+static atomic_t timer_workqueue_count = ATOMIC_INIT(0);
+static atomic_t edu_workqueue_count = ATOMIC_INIT(0);
 /* threaded_irqs */
 static atomic_t threaded_irq_count = ATOMIC_INIT(0);
 /* Pointer to start of edu register data */
@@ -40,10 +53,6 @@ static struct pci_dev *edu_dev = NULL;
 struct proc_dir_entry *proc;
 /* Create a timer var */
 static struct hrtimer gtimer;
-/* Create global tasklet variable */
-static struct tasklet_struct timer_tasklet;  
-/* Workqueue structure */
-struct work_struct gwork;
 /* Stats function */
 static int show_stats(struct seq_file *file, void *);
 /* Dev irq handlers */
@@ -109,8 +118,8 @@ static int __init irqdriver_init(void)
 		return err;
 	}
 	/* Initialize global variables */
-	tasklet_init(&timer_tasklet, timer_tasklet_callback, 0);
-	INIT_WORK(&gwork, timer_workqueue_callback);
+	tasklet_init(&tasklet_data.tasklet, timer_tasklet_callback, (unsigned long)&tasklet_data);
+	INIT_WORK(&workqueue_data.work, timer_workqueue_callback);
 	hrtimer_init(&gtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	/* Register top-half callback */
 	gtimer.function = timer_callback;
@@ -123,9 +132,9 @@ static void __exit irqdriver_exit(void)
 	/* Stop timer */
 	hrtimer_cancel(&gtimer);
 	/* Free tasklet */
-	tasklet_kill(&timer_tasklet);
+	tasklet_kill(&tasklet_data.tasklet);
 	/* Free workqueue */
-	cancel_work_sync(&gwork);
+	cancel_work_sync(&workqueue_data.work);
 	/* Delete /proc file */
 	remove_proc_entry("irqdriver", NULL);
 	free_irq(edu_dev->irq, edu_dev);
@@ -140,8 +149,10 @@ int show_stats(struct seq_file *file, void *) {
 	seq_printf(file, "hrtimer handled %d irqs\n", atomic_read(&timer_count));
 	seq_printf(file, "edu handled %d irqs\n", atomic_read(&edu_count));
 	seq_printf(file, "------SOFTIRQS------\n");
-	seq_printf(file, "tasklet handled %d irqs\n", atomic_read(&tasklet_count));
-	seq_printf(file, "workqueue handled %d irqs\n", atomic_read(&workqueue_count));
+	seq_printf(file, "tasklet handled %d irqs from timer\n", atomic_read(&timer_tasklet_count));
+	seq_printf(file, "tasklet handled %d irqs from edu\n", atomic_read(&edu_tasklet_count));
+	seq_printf(file, "workqueue handled %d irqs from timer\n", atomic_read(&timer_workqueue_count));
+	seq_printf(file, "workqueue handled %d irqs from edu\n", atomic_read(&edu_workqueue_count));
 	seq_printf(file, "threaded_irq handled %d irqs\n", atomic_read(&threaded_irq_count));
 	return 0;
 }
@@ -150,17 +161,33 @@ void timer_workqueue_callback(struct work_struct *work)
 {
 	/* We are not in irq context, so
 	 * sleeping is allowed */
-	/* Inc bottom-half workqueue counter */
-	atomic_inc(&workqueue_count);
+	/* We should check the irq source and inc
+	 * the following counter */
+	struct irq_workqueue_data *w_data = container_of(work, struct irq_workqueue_data, work);
+	if (!w_data) {
+		return;
+	}
+	if (w_data->src)
+		atomic_inc(&edu_workqueue_count);
+	else
+		atomic_inc(&timer_workqueue_count);
 }
 
 
-void timer_tasklet_callback(unsigned long)
+void timer_tasklet_callback(unsigned long data)
 {
 	/* msleep test. tasklet works in irq context,
 	 * so we mustnt sleep here. */
-	/* Inc bottom-half tasklet counter */
-	atomic_inc(&tasklet_count);	
+	struct irq_tasklet_data *t_data = (struct irq_tasklet_data *)data;
+	/* We should check the irq source and inc
+	 * the following counter */
+	if (!t_data) {
+		return;
+	}
+	if (t_data->src)
+		atomic_inc(&edu_tasklet_count);	
+	else
+		atomic_inc(&timer_tasklet_count);		
 }
 
 enum hrtimer_restart timer_callback(struct hrtimer *timer)
@@ -171,11 +198,13 @@ enum hrtimer_restart timer_callback(struct hrtimer *timer)
 	atomic_inc(&timer_count);
 	/* Replan the timer */
 	hrtimer_forward(timer, ktime_get(), ktime_set(0, CLOCK_INTERVAL));
-	/* Plan softirq */
-	tasklet_schedule(&timer_tasklet);
+	/* Plan tasklet */
+	tasklet_data.src = 0;
+	tasklet_schedule(&tasklet_data.tasklet);
 	/* Plan workqueue
 	 * Add gwork to list of planned actions */
-	queue_work(system_wq, &gwork);
+	workqueue_data.src = 0;
+	queue_work(system_wq, &workqueue_data.work);
 	return HRTIMER_RESTART;
 }
 
@@ -192,7 +221,11 @@ irqreturn_t edu_irq_top_half(int irq, void *dev_id)
 	/* Accept irq */
 	iowrite32(status, edu_base + EDU_REG_ACK_IRQ);
 	atomic_inc(&edu_count);
-	/* Plan bottom half in other thread */
+	/* Plan bottom-half */
+	tasklet_data.src = 1;
+	tasklet_schedule(&tasklet_data.tasklet);
+	workqueue_data.src = 1;
+	queue_work(system_wq, &workqueue_data.work);
 	return IRQ_WAKE_THREAD;	
 }
 irqreturn_t edu_irq_thread(int irq, void *dev_id)
@@ -215,7 +248,6 @@ ssize_t irqdriver_proc_write(struct file *filp, const char __user *buf, size_t s
 		printk(KERN_ERR "irqdriver: kstrtoint_from_user failed\n");
 		return err;					
 	}
-	printk(KERN_INFO "irqdriver: Write called. Val = %d\n", val);
 	/* If user wants an irq */
 	if (val == 1) {
 		iowrite32(1, edu_base + EDU_REG_RAISE_IRQ);
