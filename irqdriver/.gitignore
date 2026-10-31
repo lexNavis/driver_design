@@ -1,0 +1,8 @@
+# Объектные файлы
+*.o
+*.cmd
+*.symvers
+*.ko
+*.order
+*.mod
+*.mod.c
