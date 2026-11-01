@@ -43,7 +43,7 @@
 #define TX_RING_SIZE 		8
 #define TX_BUFFER_SIZE		((1UL << 20) + 4096)	// 1 MB + 4096
 #define TX_PACKET_SIZE		1500
-#define TIMEOUT_SIZE		1000000000
+#define TIMEOUT_SIZE		1000000
 /* Check whether tailed reached head or not */
 #define TAIL_REACHED_HEAD(tail)	((((tail) + 1) % TX_RING_SIZE) == ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TDH)))	
 /* Transmitter description. 
@@ -93,8 +93,11 @@ MODULE_PARM_DESC(target_slot, "PCI slot of the target network card (e.g. 0000:00
 static unsigned int buffer_size = (1UL << 20);
 module_param(buffer_size, uint, 0644);
 MODULE_PARM_DESC(buffer_size, "Size of DMA buffer in bytes");
+static unsigned int test_size = 0;
+module_param(test_size, uint, 0644);
+MODULE_PARM_DESC(test_size, "Size of data in bytes to test (0 = skip)");
 
-static int ring_buffer_store(const char *str, size_t len)
+static int ring_buffer_store(dma_addr_t phys_addr, size_t len)
 {
 	/* First we should find out, if
 	 * tail has not reaches head 
@@ -108,38 +111,61 @@ static int ring_buffer_store(const char *str, size_t len)
 	}
 	/* Clear desc status */
 	tx_ring[tx_tail].upper.fields.status = 0;
-	/* Copy data */
-	memcpy(tx_buffer + bytes_sent, str, len);
-	printk(KERN_INFO "dmadriver: Copied %zu bytes to offset %zu, tx_tail = %d\n", len, bytes_sent, tx_tail);
-	/* Fill descriptor */
-	tx_ring[tx_tail].buffer_addr = cpu_to_le64(tx_buffer_dma + bytes_sent);
+	
+	/* Fill descriptor with physical address */
+	tx_ring[tx_tail].buffer_addr = cpu_to_le64(phys_addr);
 	tx_ring[tx_tail].lower.flags.length = len;
 	tx_ring[tx_tail].lower.flags.cmd = (DMADRIVER_EOP | DMADRIVER_IFCS | DMADRIVER_RS);
+	
 	tx_tail = (tx_tail + 1) % TX_RING_SIZE;
 	/* Move real tail */
 	iowrite32(tx_tail, DMADRIVER_PCI_FIELD(DMADRIVER_TDT));
-	bytes_sent += len;
-	printk(KERN_INFO "dmadriver: Descriptor filled, TDT set to %d\n", tx_tail);
 	return 0;
 }
 
-static int ring_buffer_send_data(const char *str, size_t len)
+static int ring_buffer_send_data(size_t block_len)
 {
-	printk(KERN_INFO "dmadriver: Sending %zu bytes\n", len);
-	/* Clear counters */
-	bytes_sent = 0;
-	timeout = TIMEOUT_SIZE;
 	size_t offset = 0;
-	while (len > 0) {
+	while (block_len > 0) {
 		/* We can copy not more than 1500 bytes at once */
-		size_t chunk = min(len, (size_t)TX_PACKET_SIZE);
-		int err = ring_buffer_store(str + offset, chunk);
+		size_t chunk = min(block_len, (size_t)TX_PACKET_SIZE);
+		
+		/* Calculate physical address of the chunk inside tx_buffer */
+		dma_addr_t chunk_dma = tx_buffer_dma + offset;
+		
+		int err = ring_buffer_store(chunk_dma, chunk);
 		if (err) {
 			printk(KERN_ERR "dmadriver: ring_buffer_store failed\n");
 			return err;
 		}
 		offset += chunk;
-		len -= chunk;
+		block_len -= chunk;
+	}
+	return 0;
+}
+static int ring_buffer_transfer_data(size_t total_len)
+{
+	int err;
+	size_t offset = 0;
+	while (total_len > 0) {
+		size_t block = min(total_len, (size_t)buffer_size);
+		memset(tx_buffer, 0xAA, block);
+		err = ring_buffer_send_data(block);
+		if (err) {
+			printk(KERN_ERR "dmadriver: send_data failed\n");
+			return err;
+		}
+		/* Reset timeout for each block */
+		timeout = TIMEOUT_SIZE;
+		while (ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TDH)) != tx_tail) {
+			if ((--timeout) == 0) {
+				printk(KERN_ERR "dmadriver: Timeout waiting for netcard\n");
+				return -EIO;
+			}
+			cpu_relax();
+		}
+		offset += block;
+		total_len -= block;
 	}
 	return 0;
 }
@@ -198,6 +224,32 @@ static int dmadriver_configure_netcard(void)
 	data = ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TDLEN));
 	printk(KERN_INFO "dmadriver: new tdlen is 0x%x\n", data);
 	return 0;
+}
+
+static void dmadriver_benchmark(size_t size)
+{
+	ktime_t start, end;
+	s64 time_ns;
+	int err;
+
+	printk(KERN_INFO "dmadriver: --- DMA Benchmark for %zu bytes ---\n", size);
+	bytes_sent = 0;
+	timeout = TIMEOUT_SIZE;
+	start = ktime_get();
+
+	err = ring_buffer_transfer_data(size);
+	if (err) {
+		printk(KERN_ERR "dmadriver: DMA benchmark failed with error %d\n", err);
+		return;
+	}
+
+	end = ktime_get();
+	time_ns = ktime_to_ns(ktime_sub(end, start));
+	printk(KERN_INFO "dmadriver: DMA transfer of %zu bytes took %lld ns\n", size, time_ns);
+	if (time_ns > 0) {
+		u64 mbps = div_u64((u64)size * 1000, time_ns);
+		printk(KERN_INFO "dmadriver: DMA Throughput: ~%llu MB/s\n", mbps);
+	}
 }
 
 static int __init dmadriver_init(void)
@@ -262,20 +314,8 @@ static int __init dmadriver_init(void)
 	printk(KERN_INFO "dmadriver: new PCI netcard status is 0x%x\n", status);	
 	printk(KERN_INFO "dmadriver: Driver mounted\n");
 	/* Test write in DMA */
-	//const char *str = "Hello to DMA from Denis!";
-	//err = ring_buffer_send_data(str, strlen(str));
-	size_t test_size = buffer_size - 4096;
-	memset(tx_buffer, 0xAA, test_size);
-	err = ring_buffer_send_data((const char *)tx_buffer, test_size);
-	/* Wait for response */
-	msleep(100); 
-
-	u32 tdh = ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TDH));
-	printk(KERN_INFO "dmadriver: TDH after send is %u\n", tdh);
-	if (tdh == tx_tail) {
-	    printk(KERN_INFO "dmadriver: DMA transfer SUCCESS! (All packets processed)\n");
-	} else {
-	    printk(KERN_ERR "dmadriver: FAILED (TDH=%u, tx_tail=%d)\n", tdh, tx_tail);
+	if (test_size > 0) {
+	    dmadriver_benchmark(test_size);
 	}
 	return 0;
 }
@@ -291,7 +331,16 @@ static void __exit dmadriver_exit(void)
 	pci_release_regions(nc_dev);
 	/* Deactivate netcard */
 	pci_dev_put(nc_dev);	
-
+	/* Turn off netcard */
+	/* Disable transmitter before freeing memory */
+	u32 tctl = ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TCTL));
+	tctl &= ~(1 << 1); // Clear EN bit
+	iowrite32(tctl, DMADRIVER_PCI_FIELD(DMADRIVER_TCTL));
+	/* Clear ring head/tail to initial state */
+	iowrite32(0, DMADRIVER_PCI_FIELD(DMADRIVER_TDH));
+	iowrite32(0, DMADRIVER_PCI_FIELD(DMADRIVER_TDT));
+	tx_tail = 0;
+	bytes_sent = 0;
 	printk(KERN_INFO "dmadriver: Driver unmounted\n");
 }
 
