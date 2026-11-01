@@ -1,10 +1,10 @@
 #!/bin/bash
 
-# Перебираем размеры для теста
-SIZES=(16777216)
-BUFFER_SIZE=$((1 << 21)) # 2 МБ
+SIZES=(1024 65536 1048576 2097152 4194304 8388608 16777216)
 
-# Очищаем общий файл лога перед началом
+# Размер буфера фиксируем в 2 МБ 
+BUFFER_SIZE=$((1 << 21)) 
+
 LOG_FILE="/mnt/share/dma_test.log"
 > $LOG_FILE
 
@@ -14,7 +14,7 @@ for SIZE in "${SIZES[@]}"; do
     # Отвязываем карту
     echo 0000:00:06.0 | sudo tee /sys/bus/pci/drivers/e1000/unbind > /dev/null
     
-    # Очищаем кольцо логов ядра перед тестом
+    # Очищаем логи
     sudo dmesg -c > /dev/null
     
     # Загружаем модуль
@@ -27,7 +27,7 @@ for SIZE in "${SIZES[@]}"; do
         sudo rmmod dmadriver
     fi
     
-    # Сохраняем свежие логи в файл
+    # Сохраняем логи
     sudo dmesg | grep dmadriver | tee -a $LOG_FILE
     
     # Привязываем карту обратно
