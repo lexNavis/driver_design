@@ -117,6 +117,8 @@ static int ring_buffer_store(dma_addr_t phys_addr, size_t len)
 	tx_ring[tx_tail].lower.flags.length = len;
 	tx_ring[tx_tail].lower.flags.cmd = (DMADRIVER_EOP | DMADRIVER_IFCS | DMADRIVER_RS);
 	
+	/* Ensure descriptor is written to memory before notifying device */
+	dma_wmb(); 
 	tx_tail = (tx_tail + 1) % TX_RING_SIZE;
 	/* Move real tail */
 	iowrite32(tx_tail, DMADRIVER_PCI_FIELD(DMADRIVER_TDT));
@@ -192,6 +194,11 @@ static int ring_buffer_memory_allocate(void)
 
 static int dmadriver_configure_netcard(void) 
 {
+	/* Reset the netcard to clear any previous state */
+	u32 ctrl = ioread32(DMADRIVER_PCI_FIELD(0x0000));
+	iowrite32(ctrl | (1 << 26), DMADRIVER_PCI_FIELD(0x0000));
+	/* Wait for reset to complete (usually takes a few microseconds) */
+	mdelay(1); 
 	/* Enable transmitter and configure padding */
 	u32 tctl = ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TCTL));
 	printk(KERN_INFO "dmadriver: old tctl is 0x%x\n", tctl);
@@ -283,6 +290,7 @@ static int __init dmadriver_init(void)
 		printk(KERN_ERR "dmadriver: Failed to enable PCI device \n");
 		return -EIO;		
 	}
+	pci_set_master(nc_dev);
 	/* Occupy network card memory */
 	int	err = pci_request_regions(nc_dev, "dmadriver");
 	if (err) {
