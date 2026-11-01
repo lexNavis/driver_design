@@ -41,8 +41,9 @@
 #define TIPG_DEFAULT 		0x0060200A
 /* Ring buffer size */
 #define TX_RING_SIZE 		8
-#define TX_BUFFER_SIZE		((1UL << 10) + 4096)	// 16 MB + 4096
+#define TX_BUFFER_SIZE		((1UL << 20) + 4096)	// 1 MB + 4096
 #define TX_PACKET_SIZE		1500
+#define TIMEOUT_SIZE		1000000000
 /* Check whether tailed reached head or not */
 #define TAIL_REACHED_HEAD(tail)	((((tail) + 1) % TX_RING_SIZE) == ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TDH)))	
 /* Transmitter description. 
@@ -84,11 +85,14 @@ int tx_tail = 0;
 /* Number of bytes sent to netcard */
 size_t bytes_sent = 0;
 /* Wait timeout */
-int timeout = 10000000;
+int timeout = TIMEOUT_SIZE;
 /* Parameters
  * 0444 - read-only */
 module_param(target_slot, charp, 0444);
 MODULE_PARM_DESC(target_slot, "PCI slot of the target network card (e.g. 0000:00:06.0)");
+static unsigned int buffer_size = (1UL << 20);
+module_param(buffer_size, uint, 0644);
+MODULE_PARM_DESC(buffer_size, "Size of DMA buffer in bytes");
 
 static int ring_buffer_store(const char *str, size_t len)
 {
@@ -124,7 +128,7 @@ static int ring_buffer_send_data(const char *str, size_t len)
 	printk(KERN_INFO "dmadriver: Sending %zu bytes\n", len);
 	/* Clear counters */
 	bytes_sent = 0;
-	timeout = 10000000;
+	timeout = TIMEOUT_SIZE;
 	size_t offset = 0;
 	while (len > 0) {
 		/* We can copy not more than 1500 bytes at once */
@@ -149,9 +153,11 @@ static int ring_buffer_memory_allocate(void)
 		return -ENOMEM;
 	}
 	/* Allocate memory for ring buffer */
-	tx_buffer = dma_alloc_coherent(&nc_dev->dev, TX_BUFFER_SIZE, &tx_buffer_dma, GFP_KERNEL);
+	tx_buffer = dma_alloc_coherent(&nc_dev->dev, buffer_size, &tx_buffer_dma, GFP_KERNEL);
 	if (!tx_buffer) {
-		printk(KERN_ERR "dmadriver: dma_alloc_coherent failed\n");
+		printk(KERN_ERR "dmadriver: dma_alloc_coherent failed for tx_buffer\n");
+		/* Откатываем выделение кольца, чтобы не было утечки */
+		dma_free_coherent(&nc_dev->dev, TX_RING_SIZE * sizeof(struct e1000_tx_desc), tx_ring, tx_ring_dma);
 		return -ENOMEM;		
 	}
 	printk(KERN_INFO "dmadriver: Physical address for dma  = %pad", &tx_ring_dma);
@@ -197,6 +203,11 @@ static int dmadriver_configure_netcard(void)
 static int __init dmadriver_init(void)
 {
 	printk(KERN_INFO "dmadriver: Driver mounting\n");
+	/* Check if buffer size is appropriate */
+	if (buffer_size > (64 * 1024 * 1024)) { // Например, не больше 64 МБ
+	    printk(KERN_ERR "dmadriver: buffer_size too large\n");
+	    return -EINVAL;
+	}
 	/* Find network card 
 	 * We look through the network card list 
 	 * and compare their pci numbers with the
@@ -211,6 +222,10 @@ static int __init dmadriver_init(void)
 		/* If its not our card, release it */
 		pci_dev_put(dev);
 		
+	}
+	if (!nc_dev) {
+		printk(KERN_ERR "dmadriver: Target netcard not found\n");
+		return -ENODEV;
 	}
 	if (pci_enable_device(nc_dev)){
 		printk(KERN_ERR "dmadriver: Failed to enable PCI device \n");
@@ -235,27 +250,32 @@ static int __init dmadriver_init(void)
 	u32 status = ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_PCI_STATUS));
 	printk(KERN_INFO "dmadriver: old PCI netcard status is 0x%x\n", status);
 	/* Configure netcard */
-	dmadriver_configure_netcard();	
+	err = dmadriver_configure_netcard();
+	if (err) {
+		printk(KERN_ERR "dmadriver: configure failed, rolling back\n");
+		pci_iounmap(nc_dev, nc_base);
+		pci_release_regions(nc_dev);
+		pci_dev_put(nc_dev);
+		return err;
+	}
 	status = ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_PCI_STATUS));
 	printk(KERN_INFO "dmadriver: new PCI netcard status is 0x%x\n", status);	
 	printk(KERN_INFO "dmadriver: Driver mounted\n");
 	/* Test write in DMA */
-	const char *str = "Hello to DMA from Denis!";
-	err = ring_buffer_send_data(str, strlen(str));
+	//const char *str = "Hello to DMA from Denis!";
+	//err = ring_buffer_send_data(str, strlen(str));
+	size_t test_size = buffer_size - 4096;
+	memset(tx_buffer, 0xAA, test_size);
+	err = ring_buffer_send_data((const char *)tx_buffer, test_size);
 	/* Wait for response */
 	msleep(100); 
 
 	u32 tdh = ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TDH));
 	printk(KERN_INFO "dmadriver: TDH after send is %u\n", tdh);
-	// Проверяем статус последнего отправленного дескриптора
-	int last_idx = (tx_tail - 1 + TX_RING_SIZE) % TX_RING_SIZE;
-	status = tx_ring[last_idx].upper.fields.status;
-	printk(KERN_INFO "dmadriver: Status of last descriptor: 0x%x\n", status);
-
-	if (status & 0x1) { // Если бит DD (0x1) установлен
-	    printk(KERN_INFO "dmadriver: DMA transfer SUCCESS!\n");
+	if (tdh == tx_tail) {
+	    printk(KERN_INFO "dmadriver: DMA transfer SUCCESS! (All packets processed)\n");
 	} else {
-	    printk(KERN_ERR "dmadriver: DMA transfer FAILED (no DD bit)\n");
+	    printk(KERN_ERR "dmadriver: FAILED (TDH=%u, tx_tail=%d)\n", tdh, tx_tail);
 	}
 	return 0;
 }
@@ -263,7 +283,7 @@ static int __init dmadriver_init(void)
 static void __exit dmadriver_exit(void)
 {
 	printk(KERN_INFO "dmadriver: Driver unmounting\n");
-	dma_free_coherent(&nc_dev->dev, TX_BUFFER_SIZE, tx_buffer, tx_buffer_dma);
+	dma_free_coherent(&nc_dev->dev, buffer_size, tx_buffer, tx_buffer_dma);
 	dma_free_coherent(&nc_dev->dev, TX_RING_SIZE * sizeof(struct e1000_tx_desc), tx_ring,  tx_ring_dma);
 	/* Free virtual mem */
 	pci_iounmap(nc_dev, nc_base);
