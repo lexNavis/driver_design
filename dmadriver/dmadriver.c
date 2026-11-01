@@ -121,6 +121,27 @@ MODULE_PARM_DESC(target_slot, "PCI slot of the target network card (e.g. 0000:00
 static unsigned int buffer_size = (1UL << 20);
 module_param(buffer_size, uint, 0644);
 MODULE_PARM_DESC(buffer_size, "Size of DMA buffer in bytes");
+static unsigned int alloc_mode = 0;
+module_param(alloc_mode, int, 0644);
+MODULE_PARM_DESC(alloc_mode, "Type of dma memory allocation: 0 - coherent, 1 - streaming");
+
+/* Syncs cpu cache and memory so card can see new data*/
+static void sync_for_device(void)
+{
+    if (alloc_mode == 1) {
+    	/* Sync both buf and descriptors */
+        dma_sync_single_for_device(&nc_dev->dev, tx_buffer_dma, buffer_size, DMA_TO_DEVICE);
+        //dma_sync_single_for_device(&nc_dev->dev, tx_ring_dma, TX_RING_SIZE * sizeof(struct e1000_tx_desc), DMA_TO_DEVICE);
+    }
+}
+/* Syncs cpu cache and memory so cpu can see new data */
+static void sync_for_cpu(void)
+{
+    if (alloc_mode == 1) {
+        dma_sync_single_for_cpu(&nc_dev->dev, tx_buffer_dma, buffer_size, DMA_TO_DEVICE);
+        dma_sync_single_for_cpu(&nc_dev->dev, tx_ring_dma, TX_RING_SIZE * sizeof(struct e1000_tx_desc), DMA_TO_DEVICE);
+    }
+}
 
 static int ring_buffer_store(dma_addr_t phys_addr, size_t len)
 {
@@ -144,6 +165,9 @@ static int ring_buffer_store(dma_addr_t phys_addr, size_t len)
 	
 	/* Ensure descriptor is written to memory before notifying device */
 	dma_wmb(); 
+	if (alloc_mode == 1) {
+		dma_sync_single_for_device(&nc_dev->dev, tx_ring_dma, TX_RING_SIZE * sizeof(struct e1000_tx_desc), DMA_TO_DEVICE);
+	}
 	tx_tail = (tx_tail + 1) % TX_RING_SIZE;
 	/* Move real tail */
 	iowrite32(tx_tail, DMADRIVER_PCI_FIELD(DMADRIVER_TDT));
@@ -176,7 +200,9 @@ static int ring_buffer_transfer_data(size_t total_len)
 	size_t offset = 0;
 	while (total_len > 0) {
 		size_t block = min(total_len, (size_t)buffer_size);
+		sync_for_cpu();
 		memset(tx_buffer, 0xAA, block);
+		sync_for_device(); 
 		err = ring_buffer_send_data(block);
 		if (err) {
 			printk(KERN_ERR "dmadriver: send_data failed\n");
@@ -191,6 +217,7 @@ static int ring_buffer_transfer_data(size_t total_len)
 			}
 			cpu_relax();
 		}
+		sync_for_cpu(); 
 		offset += block;
 		total_len -= block;
 	}
@@ -199,20 +226,57 @@ static int ring_buffer_transfer_data(size_t total_len)
 
 static int ring_buffer_memory_allocate(void)
 {
-	/* Allocate memory for descriptor ring */
-	tx_ring = dma_alloc_coherent(&nc_dev->dev, TX_RING_SIZE * sizeof(struct e1000_tx_desc), &tx_ring_dma, GFP_KERNEL);
-	if (!tx_ring) {
-		printk(KERN_ERR "dmadriver: dma_alloc_coherent failed\n");
-		return -ENOMEM;
+	if (alloc_mode == 0 ) {
+		/* Allocate memory for descriptor ring */
+		tx_ring = dma_alloc_coherent(&nc_dev->dev, TX_RING_SIZE * sizeof(struct e1000_tx_desc), &tx_ring_dma, GFP_KERNEL);
+		if (!tx_ring) {
+			printk(KERN_ERR "dmadriver: dma_alloc_coherent failed\n");
+			return -ENOMEM;
+		}
+		/* Allocate memory for ring buffer */
+		tx_buffer = dma_alloc_coherent(&nc_dev->dev, buffer_size, &tx_buffer_dma, GFP_KERNEL);
+		if (!tx_buffer) {
+			printk(KERN_ERR "dmadriver: dma_alloc_coherent failed for tx_buffer\n");
+			/* Откатываем выделение кольца, чтобы не было утечки */
+			dma_free_coherent(&nc_dev->dev, TX_RING_SIZE * sizeof(struct e1000_tx_desc), tx_ring, tx_ring_dma);
+			return -ENOMEM;		
+		}
 	}
-	/* Allocate memory for ring buffer */
-	tx_buffer = dma_alloc_coherent(&nc_dev->dev, buffer_size, &tx_buffer_dma, GFP_KERNEL);
-	if (!tx_buffer) {
-		printk(KERN_ERR "dmadriver: dma_alloc_coherent failed for tx_buffer\n");
-		/* Откатываем выделение кольца, чтобы не было утечки */
-		dma_free_coherent(&nc_dev->dev, TX_RING_SIZE * sizeof(struct e1000_tx_desc), tx_ring, tx_ring_dma);
-		return -ENOMEM;		
+	else if (alloc_mode == 1) {
+		/* Allocate simple memory */
+		tx_ring = kmalloc(TX_RING_SIZE * sizeof(struct e1000_tx_desc), GFP_KERNEL);
+		if (!tx_ring)
+		{
+			printk(KERN_ERR "dmadriver: kmalloc failed\n");
+			return -ENOMEM;
+		}
+		/* Bind virtual address with physical address */
+		tx_ring_dma = dma_map_single(&nc_dev->dev, tx_ring, TX_RING_SIZE * sizeof(struct e1000_tx_desc), DMA_TO_DEVICE);
+		if (dma_mapping_error(&nc_dev->dev, tx_ring_dma)) {
+			printk(KERN_ERR "dmadriver: dma_map_single failed for tx_ring\n");			
+			kfree(tx_ring);
+			return -ENOMEM;
+		}
+		/* Allocate simple memory */
+		tx_buffer = kmalloc(buffer_size, GFP_KERNEL);
+		if (!tx_buffer)
+		{
+			printk(KERN_ERR "dmadriver: kmalloc failed\n");
+			dma_unmap_single(&nc_dev->dev, tx_ring_dma, TX_RING_SIZE * sizeof(struct e1000_tx_desc), DMA_TO_DEVICE);
+			kfree(tx_ring);
+			return -ENOMEM;
+		}
+		/* Bind virtual address with physical address */
+		tx_buffer_dma = dma_map_single(&nc_dev->dev, tx_buffer, buffer_size, DMA_TO_DEVICE);
+		if (dma_mapping_error(&nc_dev->dev, tx_buffer_dma)) {
+			printk(KERN_ERR "dmadriver: dma_map_single failed for tx_buffer\n");			
+			dma_unmap_single(&nc_dev->dev, tx_ring_dma, TX_RING_SIZE * sizeof(struct e1000_tx_desc), DMA_TO_DEVICE);
+			kfree(tx_ring);
+			kfree(tx_buffer);
+			return -ENOMEM;
+		}
 	}
+	
 	printk(KERN_INFO "dmadriver: Physical address for dma  = %pad", &tx_ring_dma);
 	return 0;
 }
@@ -236,6 +300,7 @@ static int dmadriver_configure_netcard(void)
 	iowrite32(TIPG_DEFAULT, DMADRIVER_PCI_FIELD(DMADRIVER_TIPG));
 	int err = ring_buffer_memory_allocate();
 	if (err) {
+		
 		return err;
 	}
 	/* Configure tx buffer parameters */
@@ -384,10 +449,12 @@ static int __init dmadriver_init(void)
 	}
 	if (!nc_dev) {
 		printk(KERN_ERR "dmadriver: Target netcard not found\n");
+		remove_proc_entry("dmadriver", NULL);
 		return -ENODEV;
 	}
 	if (pci_enable_device(nc_dev)){
 		printk(KERN_ERR "dmadriver: Failed to enable PCI device \n");
+		remove_proc_entry("dmadriver", NULL);
 		return -EIO;		
 	}
 	pci_set_master(nc_dev);
@@ -396,6 +463,7 @@ static int __init dmadriver_init(void)
 	if (err) {
 		printk(KERN_ERR "dmadriver: pci_request_regions failed. Regions are occupied\n");
 		pci_dev_put(nc_dev);
+		remove_proc_entry("dmadriver", NULL);
 		return err;		
 	}
 	/* Get base register address */
@@ -404,6 +472,7 @@ static int __init dmadriver_init(void)
 		printk(KERN_ERR "dmadriver: Failed to obtain virtual address\n");
 		pci_release_regions(nc_dev);
 		pci_dev_put(nc_dev);
+		remove_proc_entry("dmadriver", NULL);
 		return -ENOMEM;		
 	}
 	/* Read netcard inital status */
@@ -416,6 +485,7 @@ static int __init dmadriver_init(void)
 		pci_iounmap(nc_dev, nc_base);
 		pci_release_regions(nc_dev);
 		pci_dev_put(nc_dev);
+		remove_proc_entry("dmadriver", NULL);
 		return err;
 	}
 	status = ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_PCI_STATUS));
@@ -441,8 +511,16 @@ static void __exit dmadriver_exit(void)
 	msleep(10);
 	
 	/* 4. Now it's safe to free memory */
-	dma_free_coherent(&nc_dev->dev, buffer_size, tx_buffer, tx_buffer_dma);
-	dma_free_coherent(&nc_dev->dev, TX_RING_SIZE * sizeof(struct e1000_tx_desc), tx_ring,  tx_ring_dma);
+	if (alloc_mode == 0) {
+		dma_free_coherent(&nc_dev->dev, buffer_size, tx_buffer, tx_buffer_dma);
+		dma_free_coherent(&nc_dev->dev, TX_RING_SIZE * sizeof(struct e1000_tx_desc), tx_ring,  tx_ring_dma);
+	}
+	else if (alloc_mode == 1) {
+		dma_unmap_single(&nc_dev->dev, tx_buffer_dma, buffer_size, DMA_TO_DEVICE);
+		kfree(tx_buffer);
+		dma_unmap_single(&nc_dev->dev, tx_ring_dma, TX_RING_SIZE * sizeof(struct e1000_tx_desc), DMA_TO_DEVICE);
+		kfree(tx_ring);
+	}
 	
 	/* 5. Unmap registers */
 	pci_iounmap(nc_dev, nc_base);
