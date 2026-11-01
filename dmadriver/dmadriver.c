@@ -11,7 +11,12 @@
 #include <linux/minmax.h>
 #include <linux/delay.h>
 #include <linux/vmalloc.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 
+/* Prototypes */
+int dmadriver_open(struct inode *inode, struct file *filp);
+ssize_t dmadriver_write(struct file *filp, const char __user *buf, size_t len, loff_t *);
 #define VENDOR_ID 0x8086
 #define DEVICE_ID 0x100E
 #define DMADRIVER_PCI_FIELD(offset) (nc_base + (offset))
@@ -45,6 +50,7 @@
 #define TX_BUFFER_SIZE		((1UL << 20) + 4096)	// 1 MB + 4096
 #define TX_PACKET_SIZE		1500
 #define TIMEOUT_SIZE		1000000
+#define MAX_MEM_SIZE		(1UL << 26)
 /* Check whether tailed reached head or not */
 #define TAIL_REACHED_HEAD(tail)	((((tail) + 1) % TX_RING_SIZE) == ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TDH)))	
 /* Transmitter description. 
@@ -68,9 +74,15 @@ struct e1000_tx_desc {
         } fields;
     } upper;
 };
-/* target slot defines, which network card 
- * driver will be...replaced */
-static char 				*target_slot = "0000:00:06.0";
+/* Ptr to proc file */
+static struct proc_dir_entry *proc = NULL;
+static struct proc_ops ops = {
+	.proc_open = dmadriver_open,
+	.proc_write = dmadriver_write,
+	.proc_read = seq_read,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
 static struct pci_dev 		*nc_dev = NULL;
 static void __iomem			*nc_base = NULL;
 /* Descriptor ring virtual address */
@@ -87,6 +99,21 @@ int tx_tail = 0;
 size_t bytes_sent = 0;
 /* Wait timeout */
 int timeout = TIMEOUT_SIZE;
+/* target slot defines, which network card 
+ * driver will be...replaced */
+static char *target_slot = "0000:00:06.0";
+/* Counters */
+static atomic_t total_transfers = ATOMIC_INIT(0);
+static atomic64_t total_bytes_sent = ATOMIC64_INIT(0);
+/* Transfer result struct */
+struct dma_stats {
+	size_t size;
+	s64 dma_time_ns;
+	u64 memcpy_time_ns;
+	s64 dma_speed_mbps;
+	u64 memcpy_speed_mbps;	
+};
+static struct dma_stats current_stats = {0};
 /* Parameters
  * 0444 - read-only */
 module_param(target_slot, charp, 0444);
@@ -94,9 +121,6 @@ MODULE_PARM_DESC(target_slot, "PCI slot of the target network card (e.g. 0000:00
 static unsigned int buffer_size = (1UL << 20);
 module_param(buffer_size, uint, 0644);
 MODULE_PARM_DESC(buffer_size, "Size of DMA buffer in bytes");
-static unsigned int test_size = 0;
-module_param(test_size, uint, 0644);
-MODULE_PARM_DESC(test_size, "Size of data in bytes to test (0 = skip)");
 
 static int ring_buffer_store(dma_addr_t phys_addr, size_t len)
 {
@@ -253,11 +277,16 @@ static void dmadriver_benchmark(size_t size)
 
 	end = ktime_get();
 	time_ns = ktime_to_ns(ktime_sub(end, start));
+	current_stats.dma_time_ns = time_ns;
 	printk(KERN_INFO "dmadriver: DMA transfer of %zu bytes took %lld ns\n", size, time_ns);
 	if (time_ns > 0) {
 		u64 mbps = div_u64((u64)size * 1000, time_ns);
+		current_stats.dma_speed_mbps = mbps;
 		printk(KERN_INFO "dmadriver: DMA Throughput: ~%llu MB/s\n", mbps);
 	}
+	/* Save stats */
+	atomic_inc(&total_transfers);
+	atomic64_add(size, &total_bytes_sent);
 }
 
 static void memcpy_benchmark(size_t size)
@@ -293,10 +322,11 @@ static void memcpy_benchmark(size_t size)
 
 	end = ktime_get();
 	time_ns = ktime_to_ns(ktime_sub(end, start));
-
+	current_stats.memcpy_time_ns = time_ns;
 	printk(KERN_INFO "dmadriver: memcpy of %zu bytes took %lld ns\n", size, time_ns);
 	if (time_ns > 0) {
 		u64 mbps = div_u64((u64)size * 1000, time_ns);
+		current_stats.memcpy_speed_mbps = mbps;
 		printk(KERN_INFO "dmadriver: memcpy Throughput: ~%llu MB/s\n", mbps);
 	}
 
@@ -309,6 +339,8 @@ static void dmadriver_run_benchmarks(size_t size)
 	printk(KERN_INFO "dmadriver: ========================================\n");
 	printk(KERN_INFO "dmadriver: Starting benchmarks for %zu bytes\n", size);
 	printk(KERN_INFO "dmadriver: ========================================\n");
+
+	current_stats.size = size;
 
 	/* 1. Test DMA transfer */
 	dmadriver_benchmark(size);
@@ -328,6 +360,12 @@ static int __init dmadriver_init(void)
 	if (buffer_size > (64 * 1024 * 1024)) { // Например, не больше 64 МБ
 	    printk(KERN_ERR "dmadriver: buffer_size too large\n");
 	    return -EINVAL;
+	}
+	/* Create proc file */
+	proc = proc_create("dmadriver", 0666, NULL, &ops);
+	if (!proc){
+		printk(KERN_ERR "dmadriver: proc_create failed\n");
+		return -ENOMEM;		
 	}
 	/* Find network card 
 	 * We look through the network card list 
@@ -383,10 +421,6 @@ static int __init dmadriver_init(void)
 	status = ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_PCI_STATUS));
 	printk(KERN_INFO "dmadriver: new PCI netcard status is 0x%x\n", status);	
 	printk(KERN_INFO "dmadriver: Driver mounted\n");
-	/* Test write in DMA */
-	if (test_size > 0) {
-	    dmadriver_run_benchmarks(test_size);
-	}
 	return 0;
 }
 
@@ -416,8 +450,56 @@ static void __exit dmadriver_exit(void)
 	/* 6. Release regions and device */
 	pci_release_regions(nc_dev);
 	pci_dev_put(nc_dev);	
-	
+
+	remove_proc_entry("dmadriver", NULL);	
 	printk(KERN_INFO "dmadriver: Driver unmounted\n");
+}
+
+/* Proc operations */
+static int dmadriver_show_stats(struct seq_file *file, void *)
+{
+	/* Device info */
+	seq_printf(file, "Device: VID=0x%04x, DID=0x%04x, BAR0=0x%llx\n", 
+	           nc_dev->vendor, 
+	           nc_dev->device, 
+	           (unsigned long long)pci_resource_start(nc_dev, 0));
+	seq_printf(file, "=== Last Transfer Stats ===\n");
+	seq_printf(file, "Size: %zu bytes\n", current_stats.size);
+	seq_printf(file, "DMA time: %lld ns (Speed: %llu MB/s)\n", 
+		   current_stats.dma_time_ns, current_stats.dma_speed_mbps);
+	seq_printf(file, "memcpy time: %lld ns (Speed: %llu MB/s)\n", 
+		   current_stats.memcpy_time_ns, current_stats.memcpy_speed_mbps);
+	seq_printf(file, "\n=== Totals ===\n");
+	seq_printf(file, "Total transfers: %d\n", atomic_read(&total_transfers));
+	seq_printf(file, "Total bytes: %lld\n", atomic64_read(&total_bytes_sent));
+	return 0;	
+}
+
+int dmadriver_open(struct inode *inode, struct file *filp)
+{
+	(void)inode;
+	return single_open(filp, dmadriver_show_stats, NULL);
+}
+
+ssize_t dmadriver_write(struct file *filp, const char __user *buf, size_t len, loff_t *)
+{
+	unsigned int size = 0;
+	int err = 0;
+	err = kstrtoint_from_user(buf, len, 10, &size);
+	if (err < 0){
+		printk(KERN_ERR "dmadriver: kstrtoint_from_user failed\n");
+		return err;
+	}
+	/* Verify size */
+	if (size <= 0 || size > MAX_MEM_SIZE) {
+		printk(KERN_ERR "dmadriver: Invalid buffer size\n");
+		return -EINVAL;	
+	}
+	/* Reset counters */
+	bytes_sent = 0;
+	timeout = TIMEOUT_SIZE;
+	dmadriver_run_benchmarks(size);	
+	return len;	
 }
 
 module_init(dmadriver_init);
