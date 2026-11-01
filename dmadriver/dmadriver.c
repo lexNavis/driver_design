@@ -10,6 +10,7 @@
 #include <linux/processor.h>
 #include <linux/minmax.h>
 #include <linux/delay.h>
+#include <linux/vmalloc.h>
 
 #define VENDOR_ID 0x8086
 #define DEVICE_ID 0x100E
@@ -259,6 +260,67 @@ static void dmadriver_benchmark(size_t size)
 	}
 }
 
+static void memcpy_benchmark(size_t size)
+{
+	ktime_t start, end;
+	s64 time_ns;
+	void *dst;
+	size_t offset = 0;
+
+	printk(KERN_INFO "dmadriver: --- memcpy Benchmark for %zu bytes ---\n", size);
+
+	/* Allocate destination buffer. 
+	 * If kmalloc fails (e.g. not enough memory for 16MB), 
+	 * just skip the test to avoid panic */
+	dst = vmalloc(size);
+	if (!dst) {
+		printk(KERN_ERR "dmadriver: memcpy_benchmark: kmalloc failed for %zu bytes\n", size);
+		return;
+	}
+
+	/* Start timer */
+	start = ktime_get();
+
+	/* We must copy block by block, because tx_buffer 
+	 * is only buffer_size bytes long. If we try to 
+	 * memcpy the whole size, we will read out of bounds */
+	while (offset < size) {
+		size_t block = min(size - offset, (size_t)buffer_size);
+		/* Copy from our tx_buffer to the new dst buffer */
+		memcpy(dst + offset, tx_buffer, block); 
+		offset += block;
+	}
+
+	end = ktime_get();
+	time_ns = ktime_to_ns(ktime_sub(end, start));
+
+	printk(KERN_INFO "dmadriver: memcpy of %zu bytes took %lld ns\n", size, time_ns);
+	if (time_ns > 0) {
+		u64 mbps = div_u64((u64)size * 1000, time_ns);
+		printk(KERN_INFO "dmadriver: memcpy Throughput: ~%llu MB/s\n", mbps);
+	}
+
+	/* Free destination buffer */
+	vfree(dst);
+}
+
+static void dmadriver_run_benchmarks(size_t size)
+{
+	printk(KERN_INFO "dmadriver: ========================================\n");
+	printk(KERN_INFO "dmadriver: Starting benchmarks for %zu bytes\n", size);
+	printk(KERN_INFO "dmadriver: ========================================\n");
+
+	/* 1. Test DMA transfer */
+	dmadriver_benchmark(size);
+
+	/* 2. Test memcpy */
+	memcpy_benchmark(size);
+
+	printk(KERN_INFO "dmadriver: ========================================\n");
+	printk(KERN_INFO "dmadriver: Benchmarks finished\n");
+	printk(KERN_INFO "dmadriver: ========================================\n");
+}
+
 static int __init dmadriver_init(void)
 {
 	printk(KERN_INFO "dmadriver: Driver mounting\n");
@@ -323,7 +385,7 @@ static int __init dmadriver_init(void)
 	printk(KERN_INFO "dmadriver: Driver mounted\n");
 	/* Test write in DMA */
 	if (test_size > 0) {
-	    dmadriver_benchmark(test_size);
+	    dmadriver_run_benchmarks(test_size);
 	}
 	return 0;
 }
