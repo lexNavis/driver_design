@@ -331,24 +331,30 @@ static int __init dmadriver_init(void)
 static void __exit dmadriver_exit(void)
 {
 	printk(KERN_INFO "dmadriver: Driver unmounting\n");
-	dma_free_coherent(&nc_dev->dev, buffer_size, tx_buffer, tx_buffer_dma);
-	dma_free_coherent(&nc_dev->dev, TX_RING_SIZE * sizeof(struct e1000_tx_desc), tx_ring,  tx_ring_dma);
-	/* Free virtual mem */
-	pci_iounmap(nc_dev, nc_base);
-	/* Disoccupy netcard memory */
-	pci_release_regions(nc_dev);
-	/* Deactivate netcard */
-	pci_dev_put(nc_dev);	
-	/* Turn off netcard */
-	/* Disable transmitter before freeing memory */
+	
+	/* 1. Disable transmitter BEFORE touching memory and registers */
 	u32 tctl = ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TCTL));
 	tctl &= ~(1 << 1); // Clear EN bit
 	iowrite32(tctl, DMADRIVER_PCI_FIELD(DMADRIVER_TCTL));
-	/* Clear ring head/tail to initial state */
+	
+	/* 2. Reset ring pointers to initial state */
 	iowrite32(0, DMADRIVER_PCI_FIELD(DMADRIVER_TDH));
 	iowrite32(0, DMADRIVER_PCI_FIELD(DMADRIVER_TDT));
-	tx_tail = 0;
-	bytes_sent = 0;
+	
+	/* 3. Give hardware time to finish all transfers */
+	msleep(10);
+	
+	/* 4. Now it's safe to free memory */
+	dma_free_coherent(&nc_dev->dev, buffer_size, tx_buffer, tx_buffer_dma);
+	dma_free_coherent(&nc_dev->dev, TX_RING_SIZE * sizeof(struct e1000_tx_desc), tx_ring,  tx_ring_dma);
+	
+	/* 5. Unmap registers */
+	pci_iounmap(nc_dev, nc_base);
+	
+	/* 6. Release regions and device */
+	pci_release_regions(nc_dev);
+	pci_dev_put(nc_dev);	
+	
 	printk(KERN_INFO "dmadriver: Driver unmounted\n");
 }
 
