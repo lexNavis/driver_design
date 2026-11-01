@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Перебираем размеры для теста
-SIZES=(2097152)
-BUFFER_SIZE=$((1 << 20)) # 1 МБ
+SIZES=(16777216)
+BUFFER_SIZE=$((1 << 21)) # 2 МБ
 
 # Очищаем общий файл лога перед началом
 LOG_FILE="/mnt/share/dma_test.log"
