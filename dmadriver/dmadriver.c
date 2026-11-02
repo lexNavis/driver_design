@@ -17,6 +17,9 @@
 /* Prototypes */
 int dmadriver_open(struct inode *inode, struct file *filp);
 ssize_t dmadriver_write(struct file *filp, const char __user *buf, size_t len, loff_t *);
+
+typedef int (*transfer_func_t)(size_t);
+
 #define VENDOR_ID 0x8086
 #define DEVICE_ID 0x100E
 #define DMADRIVER_PCI_FIELD(offset) (nc_base + (offset))
@@ -546,7 +549,7 @@ static int dmadriver_configure_netcard(dma_addr_t ring_dma, u32 desc_count)
   return 0;
 }
 
-static void dmadriver_benchmark(size_t size)
+static void dmadriver_benchmark(size_t size, transfer_func_t func)
 {
   ktime_t start, end;
   s64 time_ns;
@@ -557,7 +560,7 @@ static void dmadriver_benchmark(size_t size)
   timeout = TIMEOUT_SIZE;
   start = ktime_get();
 
-  err = ring_buffer_transfer_data(size);
+  err = func(size);
   if (err)
   {
     printk(KERN_ERR "dmadriver: DMA benchmark failed with error %d\n", err);
@@ -579,71 +582,67 @@ static void dmadriver_benchmark(size_t size)
   atomic64_add(size, &total_bytes_sent);
 }
 
-static void memcpy_benchmark(size_t size)
+static void memcpy_benchmark(void *src, void *dst, size_t size)
 {
-  ktime_t start, end;
-  s64 time_ns;
-  void *dst;
-  size_t offset = 0;
+    ktime_t start, end;
+    s64 time_ns;
 
-  printk(KERN_INFO "dmadriver: --- memcpy Benchmark for %zu bytes ---\n", size);
+    printk(KERN_INFO "dmadriver: --- memcpy Benchmark for %zu bytes ---\n", size);
 
-  /* Allocate destination buffer.
-   * If kmalloc fails (e.g. not enough memory for 16MB),
-   * just skip the test to avoid panic */
-  dst = vmalloc(size);
-  if (!dst)
-  {
-    printk(KERN_ERR "dmadriver: memcpy_benchmark: kmalloc failed for %zu bytes\n", size);
-    return;
-  }
+    start = ktime_get();
+    memcpy(dst, src, size);
+    end = ktime_get();
 
-  /* Start timer */
-  start = ktime_get();
-
-  /* We must copy block by block, because tx_buffer
-   * is only buffer_size bytes long. If we try to
-   * memcpy the whole size, we will read out of bounds */
-  while (offset < size)
-  {
-    size_t block = min(size - offset, (size_t)buffer_size);
-    /* Copy from our tx_buffer to the new dst buffer */
-    memcpy(dst + offset, tx_buffer, block);
-    offset += block;
-  }
-
-  end = ktime_get();
-  time_ns = ktime_to_ns(ktime_sub(end, start));
-  current_stats.memcpy_time_ns = time_ns;
-  printk(KERN_INFO "dmadriver: memcpy of %zu bytes took %lld ns\n", size, time_ns);
-  if (time_ns > 0)
-  {
-    u64 mbps = div_u64((u64)size * 1000, time_ns);
-    current_stats.memcpy_speed_mbps = mbps;
-    printk(KERN_INFO "dmadriver: memcpy Throughput: ~%llu MB/s\n", mbps);
-  }
-
-  /* Free destination buffer */
-  vfree(dst);
+    time_ns = ktime_to_ns(ktime_sub(end, start));
+    current_stats.memcpy_time_ns = time_ns;
+    printk(KERN_INFO "dmadriver: memcpy of %zu bytes took %lld ns\n", size, time_ns);
+    if (time_ns > 0) {
+        u64 mbps = div_u64((u64)size * 1000, time_ns);
+        current_stats.memcpy_speed_mbps = mbps;
+        printk(KERN_INFO "dmadriver: memcpy Throughput: ~%llu MB/s\n", mbps);
+    }
 }
 
 static void dmadriver_run_benchmarks(size_t size)
 {
-  printk(KERN_INFO "dmadriver: ========================================\n");
-  printk(KERN_INFO "dmadriver: Starting benchmarks for %zu bytes\n", size);
-  printk(KERN_INFO "dmadriver: ========================================\n");
+	void *src = NULL, *dst = NULL;
+	int memcpy_ready = 0;
 
-  current_stats.size = size;
+	printk(KERN_INFO "dmadriver: ========================================\n");
+	printk(KERN_INFO "dmadriver: Starting benchmarks for %zu bytes\n", size);
+	printk(KERN_INFO "dmadriver: ========================================\n");
 
-  /* 1. Test DMA transfer */
-  dmadriver_benchmark(size);
+	current_stats.size = size;
 
-  /* 2. Test memcpy */
-  memcpy_benchmark(size);
+	/* --- Prepare memcpy buffers --- */
+	src = vmalloc(size);
+	dst = vmalloc(size);
+	if (src && dst) {
+		memset(src, 0xAA, size);
+		memcpy_ready = 1;
+	} else {
+		printk(KERN_ERR "dmadriver: vmalloc failed for memcpy buffers, skipping memcpy test\n");
+		if (src) vfree(src);
+		if (dst) vfree(dst);
+	}
 
-  printk(KERN_INFO "dmadriver: ========================================\n");
-  printk(KERN_INFO "dmadriver: Benchmarks finished\n");
-  printk(KERN_INFO "dmadriver: ========================================\n");
+	/* --- 1. Test DMA transfer --- */
+	if (alloc_mode == 2) {
+		dmadriver_benchmark(size, sg_transfer);
+	} else {
+		dmadriver_benchmark(size, ring_buffer_transfer_data); 
+	}
+
+	/* --- 2. Test memcpy --- */
+	if (memcpy_ready) {
+		memcpy_benchmark(src, dst, size);
+		vfree(dst);
+		vfree(src);
+	}
+
+	printk(KERN_INFO "dmadriver: ========================================\n");
+	printk(KERN_INFO "dmadriver: Benchmarks finished\n");
+	printk(KERN_INFO "dmadriver: ========================================\n");
 }
 
 static int __init dmadriver_init(void)
@@ -720,12 +719,9 @@ static int __init dmadriver_init(void)
   err = dmadriver_configure_netcard(tx_ring_dma, TX_RING_SIZE);
   if (err)
     return err;
-  if (alloc_mode == 2)
-  {
-    // Запускаем тест
-    size_t test = 1UL << 22;
-    sg_transfer(test);
-  }
+  // if (alloc_mode == 2) {
+  //   sg_transfer((1UL << 24));
+  // }
   status = ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_PCI_STATUS));
   printk(KERN_INFO "dmadriver: new PCI netcard status is 0x%x\n", status);
   printk(KERN_INFO "dmadriver: Driver mounted\n");
