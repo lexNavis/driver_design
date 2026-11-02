@@ -268,215 +268,241 @@ static int ring_buffer_transfer_data(size_t total_len)
 
 static void ring_buffer_memory_free(void)
 {
-	if (alloc_mode == 0)
-	{
-		if (tx_buffer)
-			dma_free_coherent(&nc_dev->dev, buffer_size, tx_buffer, tx_buffer_dma);
-		if (tx_ring)
-			dma_free_coherent(&nc_dev->dev, TX_RING_SIZE * sizeof(struct e1000_tx_desc), tx_ring, tx_ring_dma);
-	}
-	else if (alloc_mode == 1)
-	{
-		if (tx_buffer_dma) {
-			dma_unmap_single(&nc_dev->dev, tx_buffer_dma, buffer_size, DMA_TO_DEVICE);
-		}
-		if (tx_buffer)
-			kfree(tx_buffer);
-			
-		if (tx_ring_dma) {
-			dma_unmap_single(&nc_dev->dev, tx_ring_dma, TX_RING_SIZE * sizeof(struct e1000_tx_desc), DMA_TO_DEVICE);
-		}
-		if (tx_ring)
-			kfree(tx_ring);
-	}
-	else if (alloc_mode == 2)
-	{
-		if (sg_bufs)
-		{
-			for (int i = 0; i < DMADRIVER_SG_MAX_SEGMENTS; i++)
-			{
-				if (sg_bufs[i])
-					kfree(sg_bufs[i]);
-			}
-			kfree(sg_bufs);
-		}
-		if (sg_list)
-			kfree(sg_list);
-		
-		if (tx_ring)
-			dma_free_coherent(&nc_dev->dev, TX_RING_SIZE * sizeof(struct e1000_tx_desc), tx_ring, tx_ring_dma);
-	}
+  if (alloc_mode == 0)
+  {
+    if (tx_buffer)
+      dma_free_coherent(&nc_dev->dev, buffer_size, tx_buffer, tx_buffer_dma);
+    if (tx_ring)
+      dma_free_coherent(&nc_dev->dev, TX_RING_SIZE * sizeof(struct e1000_tx_desc), tx_ring, tx_ring_dma);
+  }
+  else if (alloc_mode == 1)
+  {
+    if (tx_buffer_dma)
+    {
+      dma_unmap_single(&nc_dev->dev, tx_buffer_dma, buffer_size, DMA_TO_DEVICE);
+    }
+    if (tx_buffer)
+      kfree(tx_buffer);
+
+    if (tx_ring_dma)
+    {
+      dma_unmap_single(&nc_dev->dev, tx_ring_dma, TX_RING_SIZE * sizeof(struct e1000_tx_desc), DMA_TO_DEVICE);
+    }
+    if (tx_ring)
+      kfree(tx_ring);
+  }
+  else if (alloc_mode == 2)
+  {
+    if (sg_bufs)
+    {
+      for (int i = 0; i < DMADRIVER_SG_MAX_SEGMENTS; i++)
+      {
+        if (sg_bufs[i])
+          kfree(sg_bufs[i]);
+      }
+      kfree(sg_bufs);
+    }
+    if (sg_list)
+      kfree(sg_list);
+
+    if (tx_ring)
+      dma_free_coherent(&nc_dev->dev, TX_RING_SIZE * sizeof(struct e1000_tx_desc), tx_ring, tx_ring_dma);
+  }
 }
 
 static int ring_buffer_memory_allocate(void)
 {
-	int err = -ENOMEM;
+  int err = -ENOMEM;
 
-	if (alloc_mode == 0)
-	{
-		tx_ring = dma_alloc_coherent(&nc_dev->dev, TX_RING_SIZE * sizeof(struct e1000_tx_desc), &tx_ring_dma, GFP_KERNEL);
-		if (!tx_ring) {
-			printk(KERN_ERR "dmadriver: dma_alloc_coherent failed for tx_ring\n");
-			goto err_out;
-		}
+  if (alloc_mode == 0)
+  {
+    tx_ring = dma_alloc_coherent(&nc_dev->dev, TX_RING_SIZE * sizeof(struct e1000_tx_desc), &tx_ring_dma, GFP_KERNEL);
+    if (!tx_ring)
+    {
+      printk(KERN_ERR "dmadriver: dma_alloc_coherent failed for tx_ring\n");
+      goto err_out;
+    }
 
-		tx_buffer = dma_alloc_coherent(&nc_dev->dev, buffer_size, &tx_buffer_dma, GFP_KERNEL);
-		if (!tx_buffer) {
-			printk(KERN_ERR "dmadriver: dma_alloc_coherent failed for tx_buffer\n");
-			goto err_out;
-		}
-	}
-	else if (alloc_mode == 1)
-	{
-		tx_ring = kmalloc(TX_RING_SIZE * sizeof(struct e1000_tx_desc), GFP_KERNEL);
-		if (!tx_ring) {
-			printk(KERN_ERR "dmadriver: kmalloc failed for tx_ring\n");
-			goto err_out;
-		}
+    tx_buffer = dma_alloc_coherent(&nc_dev->dev, buffer_size, &tx_buffer_dma, GFP_KERNEL);
+    if (!tx_buffer)
+    {
+      printk(KERN_ERR "dmadriver: dma_alloc_coherent failed for tx_buffer\n");
+      goto err_out;
+    }
+  }
+  else if (alloc_mode == 1)
+  {
+    tx_ring = kmalloc(TX_RING_SIZE * sizeof(struct e1000_tx_desc), GFP_KERNEL);
+    if (!tx_ring)
+    {
+      printk(KERN_ERR "dmadriver: kmalloc failed for tx_ring\n");
+      goto err_out;
+    }
 
-		tx_ring_dma = dma_map_single(&nc_dev->dev, tx_ring, TX_RING_SIZE * sizeof(struct e1000_tx_desc), DMA_TO_DEVICE);
-		if (dma_mapping_error(&nc_dev->dev, tx_ring_dma)) {
-			printk(KERN_ERR "dmadriver: dma_map_single failed for tx_ring\n");
-			tx_ring_dma = 0; // Сброс, чтобы unmap не сработал
-			goto err_out;
-		}
+    tx_ring_dma = dma_map_single(&nc_dev->dev, tx_ring, TX_RING_SIZE * sizeof(struct e1000_tx_desc), DMA_TO_DEVICE);
+    if (dma_mapping_error(&nc_dev->dev, tx_ring_dma))
+    {
+      printk(KERN_ERR "dmadriver: dma_map_single failed for tx_ring\n");
+      tx_ring_dma = 0; // Сброс, чтобы unmap не сработал
+      goto err_out;
+    }
 
-		tx_buffer = kmalloc(buffer_size, GFP_KERNEL);
-		if (!tx_buffer) {
-			printk(KERN_ERR "dmadriver: kmalloc failed for tx_buffer\n");
-			goto err_out;
-		}
+    tx_buffer = kmalloc(buffer_size, GFP_KERNEL);
+    if (!tx_buffer)
+    {
+      printk(KERN_ERR "dmadriver: kmalloc failed for tx_buffer\n");
+      goto err_out;
+    }
 
-		tx_buffer_dma = dma_map_single(&nc_dev->dev, tx_buffer, buffer_size, DMA_TO_DEVICE);
-		if (dma_mapping_error(&nc_dev->dev, tx_buffer_dma)) {
-			printk(KERN_ERR "dmadriver: dma_map_single failed for tx_buffer\n");
-			tx_buffer_dma = 0; // Сброс
-			goto err_out;
-		}
-	}
-	else if (alloc_mode == 2)
-	{
-		tx_ring = dma_alloc_coherent(&nc_dev->dev, TX_RING_SIZE * sizeof(struct e1000_tx_desc), &tx_ring_dma, GFP_KERNEL);
-		if (!tx_ring) {
-			printk(KERN_ERR "dmadriver: dma_alloc_coherent failed for tx_ring\n");
-			goto err_out;
-		}
-		memset(tx_ring, 0, TX_RING_SIZE * sizeof(struct e1000_tx_desc));
+    tx_buffer_dma = dma_map_single(&nc_dev->dev, tx_buffer, buffer_size, DMA_TO_DEVICE);
+    if (dma_mapping_error(&nc_dev->dev, tx_buffer_dma))
+    {
+      printk(KERN_ERR "dmadriver: dma_map_single failed for tx_buffer\n");
+      tx_buffer_dma = 0; // Сброс
+      goto err_out;
+    }
+  }
+  else if (alloc_mode == 2)
+  {
+    tx_ring = dma_alloc_coherent(&nc_dev->dev, TX_RING_SIZE * sizeof(struct e1000_tx_desc), &tx_ring_dma, GFP_KERNEL);
+    if (!tx_ring)
+    {
+      printk(KERN_ERR "dmadriver: dma_alloc_coherent failed for tx_ring\n");
+      goto err_out;
+    }
+    memset(tx_ring, 0, TX_RING_SIZE * sizeof(struct e1000_tx_desc));
 
-		sg_bufs = kcalloc(DMADRIVER_SG_MAX_SEGMENTS, sizeof(void *), GFP_KERNEL);
-		if (!sg_bufs) {
-			printk(KERN_ERR "dmadriver: kcalloc failed for sg_bufs\n");
-			goto err_out;
-		}
+    sg_bufs = kcalloc(DMADRIVER_SG_MAX_SEGMENTS, sizeof(void *), GFP_KERNEL);
+    if (!sg_bufs)
+    {
+      printk(KERN_ERR "dmadriver: kcalloc failed for sg_bufs\n");
+      goto err_out;
+    }
 
-		sg_list = kcalloc(DMADRIVER_SG_MAX_SEGMENTS, sizeof(struct scatterlist), GFP_KERNEL);
-		if (!sg_list) {
-			printk(KERN_ERR "dmadriver: kcalloc failed for sg_list\n");
-			goto err_out;
-		}
+    sg_list = kcalloc(DMADRIVER_SG_MAX_SEGMENTS, sizeof(struct scatterlist), GFP_KERNEL);
+    if (!sg_list)
+    {
+      printk(KERN_ERR "dmadriver: kcalloc failed for sg_list\n");
+      goto err_out;
+    }
 
-		for (int i = 0; i < DMADRIVER_SG_MAX_SEGMENTS; i++) {
-			sg_bufs[i] = kmalloc(buffer_size, GFP_KERNEL);
-			if (!sg_bufs[i]) {
-				printk(KERN_ERR "dmadriver: kmalloc failed for sg_bufs[%d]\n", i);
-				goto err_out;
-			}
-		}
-	}
+    for (int i = 0; i < DMADRIVER_SG_MAX_SEGMENTS; i++)
+    {
+      sg_bufs[i] = kmalloc(buffer_size, GFP_KERNEL);
+      if (!sg_bufs[i])
+      {
+        printk(KERN_ERR "dmadriver: kmalloc failed for sg_bufs[%d]\n", i);
+        goto err_out;
+      }
+    }
+  }
 
-	printk(KERN_INFO "dmadriver: Physical address for dma  = %pad\n", &tx_ring_dma);
-	return 0;
+  printk(KERN_INFO "dmadriver: Physical address for dma  = %pad\n", &tx_ring_dma);
+  return 0;
 
 err_out:
-	/* Here we call the single free function that handles all modes */
-	ring_buffer_memory_free();
-	return err;
+  /* Here we call the single free function that handles all modes */
+  ring_buffer_memory_free();
+  return err;
 }
-static int sg_transfer_test(void)
+static int sg_transfer(size_t size)
 {
-  /* Number of segments limited by ring size (leave room for context and safety) */
-  // int num_segments = TX_RING_SIZE - 2;
-  int nents, i, ret = 0;
-  int timeout = TIMEOUT_SIZE;
+	int nents, i, ret = 0;
+	int timeout = TIMEOUT_SIZE;
+	
+	/* Calculate how many segments we need */
+	int num_segments = size / buffer_size;
+	/* If size is not a multiple of buffer_size, add one more segment for the remainder */
+	if (size % buffer_size) {
+		num_segments++;
+	}
 
-  /* 1. Fill buffers (already allocated in __init) */
-  for (i = 0; i < DMADRIVER_SG_MAX_SEGMENTS; i++)
-  {
-    memset(sg_bufs[i], 0x11 + i, buffer_size);
-  }
+	/* Validate: we can't use more segments than we have allocated */
+	if (num_segments > DMADRIVER_SG_MAX_SEGMENTS) {
+		printk(KERN_ERR "dmadriver: requested size %zu requires %d segments, but max is %d\n", 
+		       size, num_segments, DMADRIVER_SG_MAX_SEGMENTS);
+		return -EINVAL;
+	}
 
-  /* 2. Init and map scatterlist */
-  sg_init_table(sg_list, DMADRIVER_SG_MAX_SEGMENTS);
-  for (i = 0; i < DMADRIVER_SG_MAX_SEGMENTS; i++)
-  {
-    sg_set_buf(&sg_list[i], sg_bufs[i], buffer_size);
-  }
+	/* 1. Fill buffers (only the ones we will use) */
+	for (i = 0; i < num_segments; i++) {
+		size_t fill_size = buffer_size;
+		/* Last segment might be smaller */
+		if (i == num_segments - 1 && (size % buffer_size)) {
+			fill_size = size % buffer_size;
+		}
+		memset(sg_bufs[i], 0x11 + i, fill_size);
+	}
 
-  nents = dma_map_sg(&nc_dev->dev, sg_list, DMADRIVER_SG_MAX_SEGMENTS, DMA_TO_DEVICE);
-  if (nents == 0)
-  {
-    printk(KERN_ERR "dmadriver: dma_map_sg returned 0\n");
-    return -EFAULT;
-  }
+	/* 2. Init and map scatterlist */
+	sg_init_table(sg_list, num_segments);
+	for (i = 0; i < num_segments; i++) {
+		size_t seg_size = buffer_size;
+		if (i == num_segments - 1 && (size % buffer_size)) {
+			seg_size = size % buffer_size;
+		}
+		sg_set_buf(&sg_list[i], sg_bufs[i], seg_size);
+	}
 
-  /* 3. Context descriptor (index 0) */
-  struct e1000_adv_tx_context_desc *ctx = (struct e1000_adv_tx_context_desc *)&tx_ring[0];
-  memset(ctx, 0, sizeof(struct e1000_adv_tx_context_desc));
-  /* DEXT (29) | TSE (31) | DTYP (20) */
-  ctx->type_tucmd_mlhl = cpu_to_le32(0x20000000 | 0x80000000 | 0x00100000);
-  /* MSS (16-31) = 1500, L4LEN (8-15) = 20, IDX (0-7) = 0 */
-  ctx->mss_l4len_idx = cpu_to_le32((1500 << 16) | (20 << 8) | 0);
+	nents = dma_map_sg(&nc_dev->dev, sg_list, num_segments, DMA_TO_DEVICE);
+	if (nents == 0) {
+		printk(KERN_ERR "dmadriver: dma_map_sg returned 0\n");
+		return -EFAULT;
+	}
 
-  /* 4. Data descriptors */
-  for (i = 1; i < nents + 1; i++)
-  {
-    u32 flags = 0x20000000 | 0x00100000 | 0x80000000; // DEXT | DTYP_D | TSE
+	/* 3. Context descriptor (index 0) */
+	struct e1000_adv_tx_context_desc *ctx = (struct e1000_adv_tx_context_desc *)&tx_ring[0];
+	memset(ctx, 0, sizeof(struct e1000_adv_tx_context_desc));
+	/* DEXT (29) | TSE (31) | DTYP (20) */
+	ctx->type_tucmd_mlhl = cpu_to_le32(0x20000000 | 0x80000000 | 0x00100000);
+	/* MSS (16-31) = 1500, L4LEN (8-15) = 20, IDX (0-7) = 0 */
+	ctx->mss_l4len_idx = cpu_to_le32((1500 << 16) | (20 << 8) | 0);
 
-    /* First packet needs IFCS */
-    if (i == 1)
-    {
-      flags |= 0x02000000; // IFCS
-    }
-    /* Last descriptor needs EOP and RS */
-    if (i == nents)
-    {
-      flags |= 0x01000000; // EOP
-      flags |= 0x08000000; // RS
-    }
+	/* 4. Data descriptors */
+	for (i = 1; i < nents + 1; i++) {
+		u32 flags = 0x20000000 | 0x00100000 | 0x80000000; // DEXT | DTYP_D | TSE
 
-    tx_ring[i].buffer_addr = cpu_to_le64(sg_dma_address(&sg_list[i - 1]));
-    tx_ring[i].lower.data = cpu_to_le32(flags | cpu_to_le16(sg_dma_len(&sg_list[i - 1])));
-    tx_ring[i].upper.fields.status = 0;
-  }
+		/* First packet needs IFCS */
+		if (i == 1) {
+			flags |= 0x02000000; // IFCS
+		}
+		/* Last descriptor needs EOP and RS */
+		if (i == nents) {
+			flags |= 0x01000000; // EOP
+			flags |= 0x08000000; // RS
+		}
 
-  /* 5. Reset ring and give command */
-  iowrite32(0, DMADRIVER_PCI_FIELD(DMADRIVER_TDH));
-  iowrite32(0, DMADRIVER_PCI_FIELD(DMADRIVER_TDT));
+		tx_ring[i].buffer_addr = cpu_to_le64(sg_dma_address(&sg_list[i - 1]));
+		tx_ring[i].lower.data = cpu_to_le32(flags | cpu_to_le16(sg_dma_len(&sg_list[i - 1])));
+		tx_ring[i].upper.fields.status = 0;
+	}
 
-  dma_wmb();
-  dma_sync_sg_for_device(&nc_dev->dev, sg_list, nents, DMA_TO_DEVICE);
+	/* 5. Reset ring and give command */
+	iowrite32(0, DMADRIVER_PCI_FIELD(DMADRIVER_TDH));
+	iowrite32(0, DMADRIVER_PCI_FIELD(DMADRIVER_TDT));
 
-  /* Send: context (1) + data (nents) */
-  iowrite32(nents + 1, DMADRIVER_PCI_FIELD(DMADRIVER_TDT));
+	dma_wmb();
+	dma_sync_sg_for_device(&nc_dev->dev, sg_list, nents, DMA_TO_DEVICE);
 
-  /* 6. Wait for completion */
-  while (ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TDH)) != (nents + 1))
-  {
-    if ((--timeout) == 0)
-    {
-      printk(KERN_ERR "dmadriver: Extended SG timeout!\n");
-      ret = -EIO;
-      goto clean_all;
-    }
-    cpu_relax();
-  }
+	/* Send: context (1) + data (nents) */
+	iowrite32(nents + 1, DMADRIVER_PCI_FIELD(DMADRIVER_TDT));
 
-  /* 7. Success */
-  printk(KERN_INFO "dmadriver: Extended SG transfer SUCCESS! TDH = %d\n", nents + 1);
+	/* 6. Wait for completion */
+	while (ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TDH)) != (nents + 1)) {
+		if ((--timeout) == 0) {
+			printk(KERN_ERR "dmadriver: Extended SG timeout!\n");
+			ret = -EIO;
+			goto clean_all;
+		}
+		cpu_relax();
+	}
+
+	/* 7. Success */
+	printk(KERN_INFO "dmadriver: Extended SG transfer SUCCESS! TDH = %d\n", nents + 1);
 
 clean_all:
-  dma_unmap_sg(&nc_dev->dev, sg_list, nents, DMA_TO_DEVICE);
-  return ret;
+	dma_unmap_sg(&nc_dev->dev, sg_list, nents, DMA_TO_DEVICE);
+	return ret;
 }
 static int dmadriver_configure_netcard(dma_addr_t ring_dma, u32 desc_count)
 {
@@ -697,7 +723,8 @@ static int __init dmadriver_init(void)
   if (alloc_mode == 2)
   {
     // Запускаем тест
-    sg_transfer_test();
+    size_t test = 1UL << 22;
+    sg_transfer(test);
   }
   status = ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_PCI_STATUS));
   printk(KERN_INFO "dmadriver: new PCI netcard status is 0x%x\n", status);
