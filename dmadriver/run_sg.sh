@@ -12,7 +12,7 @@ echo 0000:00:06.0 | sudo tee /sys/bus/pci/drivers/e1000/unbind > /dev/null
 sudo dmesg -c > /dev/null
 
 # 3. Загружаем модуль в режиме SG (alloc_mode=2)
-sudo insmod dmadriver.ko alloc_mode=2
+sudo insmod dmadriver.ko alloc_mode=2 buffer_size=$((1<<21))
 
 if [ $? -ne 0 ]; then
     echo "ERROR: Module failed to load in SG mode" | tee -a $LOG_FILE
