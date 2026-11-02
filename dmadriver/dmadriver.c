@@ -375,102 +375,119 @@ static void sg_memory_free(void)
 
 static int sg_transfer_test(void)
 {
-	u8 *sg_part1 = kmalloc(512, GFP_KERNEL);
-	if (!sg_part1) {
-		printk(KERN_ERR "dmadriver: kamlloc failed for sg_part1\n");
+	/* Local number of segments for test */
+	int num_segments = 3; 
+	
+	/* Allocate buffers for this specific test */
+	u8 **local_bufs = kcalloc(num_segments, sizeof(u8 *), GFP_KERNEL);
+	if (!local_bufs) {
+		printk(KERN_ERR "dmadriver: kcalloc failed for local_bufs\n");
 		return -ENOMEM;
 	}
-    u8 *sg_part2 = kmalloc(512, GFP_KERNEL);
-	if (!sg_part2) {
-		printk(KERN_ERR "dmadriver: kamlloc failed for sg_part2\n");
-		kfree(sg_part1);
+	
+	struct scatterlist *local_sg = kcalloc(num_segments, sizeof(struct scatterlist), GFP_KERNEL);
+	if (!local_sg) {
+		printk(KERN_ERR "dmadriver: kcalloc failed for local_sg\n");
+		kfree(local_bufs);
 		return -ENOMEM;
 	}
-	/* 1. Fill buffers */
-	memset(sg_part1, 0x11, 512);
-	memset(sg_part2, 0x22, 512);
 
-	struct scatterlist sg[SG_BUFFER_COUNT];
-	sg_init_table(sg, SG_BUFFER_COUNT);
-	sg_set_buf(&sg[0], sg_part1, 512);
-	sg_set_buf(&sg[1], sg_part2, 512);
-	int nents = dma_map_sg(&nc_dev->dev, sg, 2, DMA_TO_DEVICE);
+	/* 1. Fill buffers */
+	for (int i = 0; i < num_segments; i++) {
+		local_bufs[i] = kmalloc(buffer_size, GFP_KERNEL);
+		if (!local_bufs[i]) {
+			printk(KERN_ERR "dmadriver: kmalloc failed for local_bufs[%d]\n", i);
+			while (--i >= 0) kfree(local_bufs[i]);
+			kfree(local_sg);
+			kfree(local_bufs);
+			return -ENOMEM;
+		}
+		memset(local_bufs[i], 0x11 + i, buffer_size);
+	}
+
+	/* 2. Init and map scatterlist */
+	sg_init_table(local_sg, num_segments);
+	for (int i = 0; i < num_segments; i++) {
+		sg_set_buf(&local_sg[i], local_bufs[i], buffer_size);
+	}
+	
+	int nents = dma_map_sg(&nc_dev->dev, local_sg, num_segments, DMA_TO_DEVICE);
 	if (nents == 0) {
 		printk(KERN_ERR "dmadriver: dma_map_sg returned 0\n");
-		kfree(sg_part2);
-		kfree(sg_part1);
+		for (int i = 0; i < num_segments; i++) kfree(local_bufs[i]);
+		kfree(local_sg);
+		kfree(local_bufs);
 		return -EFAULT;
 	}
 
-	/* 2. Context descriptor (index 0) 
+	/* 3. Context descriptor (index 0) 
 	 * DEXT (bit 29) = 0x20000000
 	 * TSE  (bit 31) = 0x80000000
-	 * We MUST fill MSS and HDRLEN to avoid QEMU infinite loop (CVE-2015-6815)
-	 * mss_l4len_idx: MSS in bits 0-15, L4len in bits 16-23, idx in 24-31
-	 * Let's put MSS = 1500 (0x5DC), L4len = 0 (no TCP header) */
+	 * DTYP (bits 20-23) = 0x00100000 
+	 * MSS (bits 16-31) = 1500
+	 * L4LEN (bits 8-15) = 20 (must not be 0!)
+	 * IDX (bits 0-7) = 0 */
 	struct e1000_adv_tx_context_desc *ctx = (struct e1000_adv_tx_context_desc *)&sg_tx_ring[0];
 	memset(ctx, 0, sizeof(struct e1000_adv_tx_context_desc));
-	ctx->type_tucmd_mlhl = cpu_to_le32(0x20000000 | 0x80000000); 
-	ctx->mss_l4len_idx = cpu_to_le32(1500); /* MSS = 1500 */
+	ctx->type_tucmd_mlhl = cpu_to_le32(0x20000000 | 0x80000000 | 0x00100000);
+	u32 mss = 1500;
+	u32 l4len = 20; 
+	u32 idx = 0;
+	ctx->mss_l4len_idx = cpu_to_le32((mss << 16) | (l4len << 8) | idx);
 
-	/* 3. First data descriptor (index 1) 
-	 * DEXT   (bit 29) = 0x20000000
-	 * DTYP_D (bit 20) = 0x00100000 (critical for QEMU to see it as data)
-	 * TSE    (bit 31) = 0x80000000
-	 * IFCS   (bit 25) = 0x02000000
-	 * Length = 512 (0x200) in bits 0-15
-	 * cmd = 0 */
-	sg_tx_ring[1].buffer_addr = cpu_to_le64(sg_dma_address(&sg[0]));
-	sg_tx_ring[1].lower.data = cpu_to_le32(
-		(0x20000000 | 0x00100000 | 0x80000000 | 0x02000000) | cpu_to_le16(sg_dma_len(&sg[0]))
-	);
-	sg_tx_ring[1].upper.fields.status = 0;
+	/* 4. Data descriptors */
+	for (int i = 1; i < nents + 1; i++) {
+		u32 flags = 0x20000000 | 0x00100000 | 0x80000000; // DEXT | DTYP_D | TSE (base)
 
-	/* 4. Second data descriptor (index 2) 
-	 * DEXT   (bit 29) = 0x20000000
-	 * DTYP_D (bit 20) = 0x00100000
-	 * TSE    (bit 31) = 0x80000000
-	 * RS     (bit 27) = 0x08000000
-	 * EOP    (bit 24) = 0x01000000
-	 * Length = 512 (0x200) in bits 0-15
-	 * No IFCS here (it was on first) */
-	sg_tx_ring[2].buffer_addr = cpu_to_le64(sg_dma_address(&sg[1]));
-	sg_tx_ring[2].lower.data = cpu_to_le32(
-		(0x20000000 | 0x00100000 | 0x80000000 | 0x08000000 | 0x01000000) | cpu_to_le16(sg_dma_len(&sg[1]))
-	);
-	sg_tx_ring[2].upper.fields.status = 0;
+		/* First packet needs IFCS */
+		if (i == 1) {
+			flags |= 0x02000000;
+		}
+		/* Last descriptor needs EOP and RS */
+		if (i == nents) {
+			flags |= 0x01000000; // EOP
+			flags |= 0x08000000; // RS
+		}
+
+		sg_tx_ring[i].buffer_addr = cpu_to_le64(sg_dma_address(&local_sg[i - 1]));
+		sg_tx_ring[i].lower.data = cpu_to_le32(flags | cpu_to_le16(sg_dma_len(&local_sg[i - 1])));
+		sg_tx_ring[i].upper.fields.status = 0;
+	}
 
 	/* 5. Reset ring and give command */
 	iowrite32(0, DMADRIVER_PCI_FIELD(DMADRIVER_TDH));
 	iowrite32(0, DMADRIVER_PCI_FIELD(DMADRIVER_TDT));
 
 	dma_wmb(); /* Ensure descriptors are in memory */
+	dma_sync_sg_for_device(&nc_dev->dev, local_sg, nents, DMA_TO_DEVICE);
 
-	iowrite32(3, DMADRIVER_PCI_FIELD(DMADRIVER_TDT)); /* Send 3 descriptors */
+	iowrite32(nents + 1, DMADRIVER_PCI_FIELD(DMADRIVER_TDT)); /* Send context + data */
 
 	/* 6. Wait for completion */
 	int t = TIMEOUT_SIZE;
-	while (ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TDH)) != 3)
+	while (ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TDH)) != (nents + 1))
 	{
 		if ((--t) == 0)
 		{
 			printk(KERN_ERR "dmadriver: Extended SG timeout!\n");
-			dma_unmap_sg(&nc_dev->dev, sg, 2, DMA_TO_DEVICE);
-			kfree(sg_part1);
-			kfree(sg_part2);
+			dma_unmap_sg(&nc_dev->dev, local_sg, nents, DMA_TO_DEVICE);
+			for (int i = 0; i < num_segments; i++) kfree(local_bufs[i]);
+			kfree(local_sg);
+			kfree(local_bufs);
 			return -EIO;
 		}
 		cpu_relax();
 	}
 
 	/* 7. Success */
-	printk(KERN_INFO "dmadriver: Extended SG transfer SUCCESS! TDH = 3\n");
-    dma_unmap_sg(&nc_dev->dev, sg, 2, DMA_TO_DEVICE);
-    kfree(sg_part1);
-    kfree(sg_part2);
+	printk(KERN_INFO "dmadriver: Extended SG transfer SUCCESS! TDH = %d\n", nents + 1);
+	
+	dma_unmap_sg(&nc_dev->dev, local_sg, nents, DMA_TO_DEVICE);
+	for (int i = 0; i < num_segments; i++) kfree(local_bufs[i]);
+	kfree(local_sg);
+	kfree(local_bufs);
 	return 0;
 }
-
 static int dmadriver_configure_netcard(dma_addr_t ring_dma, u32 desc_count)
 {
 	/* Reset the netcard to clear any previous state */
