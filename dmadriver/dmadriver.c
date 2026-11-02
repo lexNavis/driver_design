@@ -59,6 +59,8 @@ ssize_t dmadriver_write(struct file *filp, const char __user *buf, size_t len, l
 /* Ring buffer size */
 #define TX_RING_SIZE 8
 #define TX_BUFFER_SIZE ((1UL << 20) + 4096) // 1 MB + 4096
+/* Buffer count for scatter-gather */
+#define SG_BUFFER_COUNT 2
 #define TX_PACKET_SIZE 1500
 #define TIMEOUT_SIZE 1000000
 #define MAX_MEM_SIZE (1UL << 26)
@@ -121,11 +123,6 @@ dma_addr_t tx_buffer_dma = 0;
 struct e1000_tx_desc *sg_tx_ring = NULL;
 /* Physical memory address of descriptor ring */
 dma_addr_t sg_tx_ring_dma = 0;
-/* Buffer parts for scatter-gather */
-static u8 *sg_part1 = NULL;
-static u8 *sg_part2 = NULL;
-dma_addr_t sg_part1_dma = 0;
-dma_addr_t sg_part2_dma = 0;
 /* Tail index in ring buffer */
 int tx_tail = 0;
 /* Number of bytes sent to netcard */
@@ -347,74 +344,130 @@ static int sg_memory_allocate(void)
 	/* Clear the whole ring */
 	memset(sg_tx_ring, 0, size * sizeof(struct e1000_tx_desc));
 
-	sg_part1 = dma_alloc_coherent(&nc_dev->dev, 512, &sg_part1_dma, GFP_KERNEL);
-	if (!sg_part1)
-	{
-		printk(KERN_ERR "dmadriver: dma_alloc_coherent failed for sg_part1\n");
-		dma_free_coherent(&nc_dev->dev, size * sizeof(struct e1000_tx_desc), sg_tx_ring, sg_tx_ring_dma);
-		return -ENOMEM;
-	}
+	// sg_part1 = dma_alloc_coherent(&nc_dev->dev, 512, &sg_part1_dma, GFP_KERNEL);
+	// if (!sg_part1)
+	// {
+	// 	printk(KERN_ERR "dmadriver: dma_alloc_coherent failed for sg_part1\n");
+	// 	dma_free_coherent(&nc_dev->dev, size * sizeof(struct e1000_tx_desc), sg_tx_ring, sg_tx_ring_dma);
+	// 	return -ENOMEM;
+	// }
 	
-	sg_part2 = dma_alloc_coherent(&nc_dev->dev, 512, &sg_part2_dma, GFP_KERNEL);
-	if (!sg_part2)
-	{
-		printk(KERN_ERR "dmadriver: dma_alloc_coherent failed for sg_part2\n");
-		dma_free_coherent(&nc_dev->dev, 512, sg_part1, sg_part1_dma);
-		dma_free_coherent(&nc_dev->dev, size * sizeof(struct e1000_tx_desc), sg_tx_ring, sg_tx_ring_dma);
-		return -ENOMEM;
-	}
+	// sg_part2 = dma_alloc_coherent(&nc_dev->dev, 512, &sg_part2_dma, GFP_KERNEL);
+	// if (!sg_part2)
+	// {
+	// 	printk(KERN_ERR "dmadriver: dma_alloc_coherent failed for sg_part2\n");
+	// 	dma_free_coherent(&nc_dev->dev, 512, sg_part1, sg_part1_dma);
+	// 	dma_free_coherent(&nc_dev->dev, size * sizeof(struct e1000_tx_desc), sg_tx_ring, sg_tx_ring_dma);
+	// 	return -ENOMEM;
+	// }
 	return 0;
 }
 
 static void sg_memory_free(void)
 {
-	if (sg_part1)
-		dma_free_coherent(&nc_dev->dev, 512, sg_part1, sg_part1_dma);
-	if (sg_part2)
-		dma_free_coherent(&nc_dev->dev, 512, sg_part2, sg_part2_dma);
+	// if (sg_part1)
+	// 	dma_free_coherent(&nc_dev->dev, 512, sg_part1, sg_part1_dma);
+	// if (sg_part2)
+	// 	dma_free_coherent(&nc_dev->dev, 512, sg_part2, sg_part2_dma);
 	if (sg_tx_ring)
 		dma_free_coherent(&nc_dev->dev, TX_RING_SIZE * sizeof(struct e1000_tx_desc), sg_tx_ring, sg_tx_ring_dma);
 }
 
 static int sg_transfer_test(void)
 {
+	u8 *sg_part1 = kmalloc(512, GFP_KERNEL);
+	if (!sg_part1) {
+		printk(KERN_ERR "dmadriver: kamlloc failed for sg_part1\n");
+		return -ENOMEM;
+	}
+    u8 *sg_part2 = kmalloc(512, GFP_KERNEL);
+	if (!sg_part2) {
+		printk(KERN_ERR "dmadriver: kamlloc failed for sg_part2\n");
+		kfree(sg_part1);
+		return -ENOMEM;
+	}
 	/* 1. Fill buffers */
 	memset(sg_part1, 0x11, 512);
 	memset(sg_part2, 0x22, 512);
 
-	/* 2. First data descriptor (index 0) - legacy, no EOP */
-	sg_tx_ring[0].buffer_addr = cpu_to_le64(sg_part1_dma);
-	sg_tx_ring[0].lower.flags.length = cpu_to_le16(512);
-	sg_tx_ring[0].lower.flags.cmd = 0; /* No DEXT, no EOP */
-	sg_tx_ring[0].upper.fields.status = 0;
+	struct scatterlist sg[SG_BUFFER_COUNT];
+	sg_init_table(sg, SG_BUFFER_COUNT);
+	sg_set_buf(&sg[0], sg_part1, 512);
+	sg_set_buf(&sg[1], sg_part2, 512);
+	int nents = dma_map_sg(&nc_dev->dev, sg, 2, DMA_TO_DEVICE);
+	if (nents == 0) {
+		printk(KERN_ERR "dmadriver: dma_map_sg returned 0\n");
+		kfree(sg_part2);
+		kfree(sg_part1);
+		return -EFAULT;
+	}
 
-	/* 3. Second data descriptor (index 1) - legacy, with EOP */
-	sg_tx_ring[1].buffer_addr = cpu_to_le64(sg_part2_dma);
-	sg_tx_ring[1].lower.flags.length = cpu_to_le16(512);
-	sg_tx_ring[1].lower.flags.cmd = (DMADRIVER_EOP | DMADRIVER_IFCS | DMADRIVER_RS);
+	/* 2. Context descriptor (index 0) 
+	 * DEXT (bit 29) = 0x20000000
+	 * TSE  (bit 31) = 0x80000000
+	 * We MUST fill MSS and HDRLEN to avoid QEMU infinite loop (CVE-2015-6815)
+	 * mss_l4len_idx: MSS in bits 0-15, L4len in bits 16-23, idx in 24-31
+	 * Let's put MSS = 1500 (0x5DC), L4len = 0 (no TCP header) */
+	struct e1000_adv_tx_context_desc *ctx = (struct e1000_adv_tx_context_desc *)&sg_tx_ring[0];
+	memset(ctx, 0, sizeof(struct e1000_adv_tx_context_desc));
+	ctx->type_tucmd_mlhl = cpu_to_le32(0x20000000 | 0x80000000); 
+	ctx->mss_l4len_idx = cpu_to_le32(1500); /* MSS = 1500 */
+
+	/* 3. First data descriptor (index 1) 
+	 * DEXT   (bit 29) = 0x20000000
+	 * DTYP_D (bit 20) = 0x00100000 (critical for QEMU to see it as data)
+	 * TSE    (bit 31) = 0x80000000
+	 * IFCS   (bit 25) = 0x02000000
+	 * Length = 512 (0x200) in bits 0-15
+	 * cmd = 0 */
+	sg_tx_ring[1].buffer_addr = cpu_to_le64(sg_dma_address(&sg[0]));
+	sg_tx_ring[1].lower.data = cpu_to_le32(
+		(0x20000000 | 0x00100000 | 0x80000000 | 0x02000000) | cpu_to_le16(sg_dma_len(&sg[0]))
+	);
 	sg_tx_ring[1].upper.fields.status = 0;
 
-	/* 4. Reset ring and give command */
+	/* 4. Second data descriptor (index 2) 
+	 * DEXT   (bit 29) = 0x20000000
+	 * DTYP_D (bit 20) = 0x00100000
+	 * TSE    (bit 31) = 0x80000000
+	 * RS     (bit 27) = 0x08000000
+	 * EOP    (bit 24) = 0x01000000
+	 * Length = 512 (0x200) in bits 0-15
+	 * No IFCS here (it was on first) */
+	sg_tx_ring[2].buffer_addr = cpu_to_le64(sg_dma_address(&sg[1]));
+	sg_tx_ring[2].lower.data = cpu_to_le32(
+		(0x20000000 | 0x00100000 | 0x80000000 | 0x08000000 | 0x01000000) | cpu_to_le16(sg_dma_len(&sg[1]))
+	);
+	sg_tx_ring[2].upper.fields.status = 0;
+
+	/* 5. Reset ring and give command */
 	iowrite32(0, DMADRIVER_PCI_FIELD(DMADRIVER_TDH));
 	iowrite32(0, DMADRIVER_PCI_FIELD(DMADRIVER_TDT));
 
 	dma_wmb(); /* Ensure descriptors are in memory */
 
-	iowrite32(2, DMADRIVER_PCI_FIELD(DMADRIVER_TDT)); /* Send 2 descriptors */
+	iowrite32(3, DMADRIVER_PCI_FIELD(DMADRIVER_TDT)); /* Send 3 descriptors */
 
-	/* 5. Wait for completion */
+	/* 6. Wait for completion */
 	int t = TIMEOUT_SIZE;
-	while (ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TDH)) != 2)
+	while (ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TDH)) != 3)
 	{
 		if ((--t) == 0)
 		{
-			printk(KERN_ERR "dmadriver: SG timeout!\n");
+			printk(KERN_ERR "dmadriver: Extended SG timeout!\n");
+			dma_unmap_sg(&nc_dev->dev, sg, 2, DMA_TO_DEVICE);
+			kfree(sg_part1);
+			kfree(sg_part2);
 			return -EIO;
 		}
 		cpu_relax();
 	}
 
-	printk(KERN_INFO "dmadriver: SG transfer SUCCESS! TDH = 2\n");
+	/* 7. Success */
+	printk(KERN_INFO "dmadriver: Extended SG transfer SUCCESS! TDH = 3\n");
+    dma_unmap_sg(&nc_dev->dev, sg, 2, DMA_TO_DEVICE);
+    kfree(sg_part1);
+    kfree(sg_part2);
 	return 0;
 }
 
