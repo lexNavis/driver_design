@@ -37,9 +37,9 @@ for SIZE in "${SIZES[@]}"; do
     echo "--- /proc/dmadriver ---" | tee -a $LOG_FILE
     cat /proc/dmadriver | tee -a $LOG_FILE
     
-    # 5. Сохраняем логи dmesg
-    echo "--- dmesg ---" >> $LOG_FILE
-    sudo dmesg | grep dmadriver >> $LOG_FILE
+    # 5. Сохраняем логи dmesg (если хочешь)
+    echo "--- dmesg ---" | tee -a $LOG_FILE
+    sudo dmesg | grep dmadriver | tee -a $LOG_FILE
     
     echo "----------------------------------------" | tee -a $LOG_FILE
 done
