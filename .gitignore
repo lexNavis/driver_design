@@ -17,6 +17,7 @@ flusher
 af_packet
 rng_test
 test_ioctl
+irq_user
 
 # Service folders
 logs/
