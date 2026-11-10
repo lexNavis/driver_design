@@ -43,14 +43,7 @@ run_tests() {
         # Очищаем логи
         sudo dmesg -c > /dev/null
         
-        # Инициируем передачу через /proc
-        echo $SIZE | sudo tee /proc/dmadriver > /dev/null
-        
-        # Ждем завершения
-        sleep 3
-        
-        # Читаем результат
-        cat /proc/dmadriver | tee -a $LOG_FILE
+	sudo ./user_app.sh $SIZE | tee -a $LOG_FILE
         
         echo "----------------------------------------" | tee -a $LOG_FILE
     done
