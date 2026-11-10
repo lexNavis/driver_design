@@ -23,10 +23,13 @@ typedef int (*transfer_func_t)(size_t);
 #define VENDOR_ID 0x8086
 #define DEVICE_ID 0x100E
 #define DMADRIVER_PCI_FIELD(offset) (nc_base + (offset))
+
 /* Define offsets */
 #define DMADRIVER_PCI_STATUS 0x0008
 #define DMADRIVER_TCTL 0x0400
 #define DMADRIVER_TIPG 0x0410
+#define DMADRIVER_CTRL 0x0000
+
 /* Transmit descriptor base address low */
 #define DMADRIVER_TDBAL 0x3800
 /* Transmit descriptor base address high */
@@ -37,28 +40,61 @@ typedef int (*transfer_func_t)(size_t);
 #define DMADRIVER_TDH 0x3810
 /* Ring tail */
 #define DMADRIVER_TDT 0x3818
+
+/* Device Reset bit: writing 1 to this bit initiates a global reset of the device */
+#define CTRL_RST (1 << 26)
+/* TCTL Register Bits */
+/* Transmit Enable: enables the transmitter */
+#define TCTL_EN_BIT (1 << 1)
+
 /* Enable transmitter */
-#define ENABLE_EN(reg) ((reg) |= (1 << 1))
+#define ENABLE_EN(reg) ((reg) |= TCTL_EN_BIT)
 /* Enable padding for short packets */
 #define ENABLE_PSP(reg) ((reg) |= (1 << 3))
-/* Enable extended descriptor */
-#define CMD_DEXT (1 << 5)
-/* Flag, that packet is a segment */
-#define CMD_TSE (1 << 2)
-/* Report status flag */
-#define CMD_RS (1 << 3)
-/* Insert FCS */
-#define CMD_IFCS (1 << 1)
-/* End of packet */
-#define CMD_EOP (1 << 0)
+
+/* --- Context Descriptor Bits (32-bit word) ---
+ * These bits go into ctx->type_tucmd_mlhl
+ */
+/* Descriptor Extension: tells hardware this is an advanced (not legacy) descriptor */
+#define CTX_DEXT (1 << 29)  // 0x20000000
+/* TCP Segmentation Enable: enables TSO context */
+#define CTX_TSE (1 << 31)   // 0x80000000
+/* Descriptor Type: 1 = Context Descriptor (required for QEMU to recognize it) */
+#define CTX_DTYP (1 << 20)  // 0x00100000
+
+/* --- Data Descriptor Bits (32-bit word) ---
+ * These bits go into tx_ring[i].lower.data
+ */
+/* Descriptor Extension: tells hardware this is an advanced (not legacy) data descriptor */
+#define DATA_DEXT (1 << 29)   // 0x20000000
+/* Descriptor Type: 1 = Data Descriptor (critical for QEMU, otherwise it treats it as context) */
+#define DATA_DTYP_D (1 << 20) // 0x00100000
+/* TCP Segmentation Enable: marks this packet as part of a TSO stream */
+#define DATA_TSE (1 << 31)    // 0x80000000
+/* Insert FCS: tells hardware to calculate and append CRC (usually set on the first packet) */
+#define DATA_IFCS (1 << 25)   // 0x02000000
+/* End Of Packet: marks the last fragment of the packet (set only on the last descriptor) */
+#define DATA_EOP (1 << 24)    // 0x01000000
+/* Report Status: tells hardware to write back the DD (Descriptor Done) bit in status field */
+#define DATA_RS (1 << 27)     // 0x08000000
+
+/* --- Context MSS/L4LEN Packing ---
+ * These macros help pack the mss_l4len_idx field correctly.
+ */
+/* Maximum Segment Size (bits 16-31) */
+#define CTX_MSS(mss) ((mss) << 16)
+/* Length of L4 header (bits 8-15). Must NOT be zero, otherwise QEMU hangs (CVE-2015-6815) */
+#define CTX_L4LEN(len) ((len) << 8)
 
 /* Set end of packet */
 #define DMADRIVER_EOP 0x01
 #define DMADRIVER_IFCS 0x02
 /* Ask netcard to fill status register */
 #define DMADRIVER_RS 0x08
+
 /* TIPG default magic number for gigabit ethernet */
 #define TIPG_DEFAULT 0x0060200A
+
 /* Ring buffer size */
 #define TX_RING_SIZE 16
 #define TX_BUFFER_SIZE ((1UL << 20) + 4096) // 1 MB + 4096
@@ -68,8 +104,10 @@ typedef int (*transfer_func_t)(size_t);
 #define TIMEOUT_SIZE 1000000
 #define MAX_MEM_SIZE (1UL << 26)
 #define DMADRIVER_SG_MAX_SEGMENTS (TX_RING_SIZE - 2)
+
 /* Check whether tail reached head or not */
 #define TAIL_REACHED_HEAD(tail) ((((tail) + 1) % TX_RING_SIZE) == ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TDH)))
+
 /* Transmitter description.
  * Copied from e1000.h */
 struct e1000_tx_desc
@@ -96,6 +134,7 @@ struct e1000_tx_desc
     } fields;
   } upper;
 };
+
 /* Advanced descriptor context */
 struct e1000_adv_tx_context_desc
 {
@@ -104,6 +143,7 @@ struct e1000_adv_tx_context_desc
   __le32 type_tucmd_mlhl;
   __le32 mss_l4len_idx;
 };
+
 /* Ptr to proc file */
 static struct proc_dir_entry *proc = NULL;
 static struct proc_ops ops = {
@@ -113,31 +153,39 @@ static struct proc_ops ops = {
     .proc_lseek = seq_lseek,
     .proc_release = single_release,
 };
+
 static struct pci_dev *nc_dev = NULL;
 static void __iomem *nc_base = NULL;
+
 /* Descriptor ring virtual address */
 struct e1000_tx_desc *tx_ring = NULL;
 /* Physical memory address of descriptor ring */
 dma_addr_t tx_ring_dma = 0;
+
 /* Ring buffer virtual address */
 static u8 *tx_buffer = NULL;
 /* Physical memory address of ring buffer */
 dma_addr_t tx_buffer_dma = 0;
+
 /* --- Scatter-Gather Globals --- */
 static void **sg_bufs = NULL;
 static struct scatterlist *sg_list = NULL;
+
 /* Tail index in ring buffer */
 int tx_tail = 0;
 /* Number of bytes sent to netcard */
 size_t bytes_sent = 0;
 /* Wait timeout */
 int timeout = TIMEOUT_SIZE;
+
 /* target slot defines, which network card
  * driver will be...replaced */
 static char *target_slot = "0000:00:06.0";
+
 /* Counters */
 static atomic_t total_transfers = ATOMIC_INIT(0);
 static atomic64_t total_bytes_sent = ATOMIC64_INIT(0);
+
 /* Transfer result struct */
 struct dma_stats
 {
@@ -148,6 +196,7 @@ struct dma_stats
   u64 memcpy_speed_mbps;
 };
 static struct dma_stats current_stats = {0};
+
 /* Parameters
  * 0444 - read-only */
 module_param(target_slot, charp, 0444);
@@ -177,6 +226,20 @@ static void sync_for_cpu(void)
     dma_sync_single_for_cpu(&nc_dev->dev, tx_buffer_dma, buffer_size, DMA_TO_DEVICE);
     dma_sync_single_for_cpu(&nc_dev->dev, tx_ring_dma, TX_RING_SIZE * sizeof(struct e1000_tx_desc), DMA_TO_DEVICE);
   }
+}
+
+/* Waits until the netcard's TDH matches the expected tail index.
+ * Returns 0 on success, -EIO on timeout. */
+static int wait_for_tdh(u32 expected_tail)
+{
+    int t = TIMEOUT_SIZE;
+    while (ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TDH)) != expected_tail) {
+        if ((--t) == 0) {
+            return -EIO;
+        }
+        cpu_relax();
+    }
+    return 0;
 }
 
 static int ring_buffer_store(dma_addr_t phys_addr, size_t len)
@@ -235,6 +298,7 @@ static int ring_buffer_send_data(size_t block_len)
   }
   return 0;
 }
+
 static int ring_buffer_transfer_data(size_t total_len)
 {
   int err;
@@ -251,16 +315,11 @@ static int ring_buffer_transfer_data(size_t total_len)
       printk(KERN_ERR "dmadriver: send_data failed\n");
       return err;
     }
-    /* Reset timeout for each block */
-    timeout = TIMEOUT_SIZE;
-    while (ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TDH)) != tx_tail)
-    {
-      if ((--timeout) == 0)
-      {
+    /* Wait for netcard to process the block */
+    err = wait_for_tdh(tx_tail);
+    if (err) {
         printk(KERN_ERR "dmadriver: Timeout waiting for netcard\n");
-        return -EIO;
-      }
-      cpu_relax();
+        return err;
     }
     sync_for_cpu();
     offset += block;
@@ -408,10 +467,10 @@ err_out:
   ring_buffer_memory_free();
   return err;
 }
+
 static int sg_transfer(size_t size)
 {
 	int nents, i, ret = 0;
-	int timeout = TIMEOUT_SIZE;
 	
 	/* Calculate how many segments we need */
 	int num_segments = size / buffer_size;
@@ -456,23 +515,20 @@ static int sg_transfer(size_t size)
 	/* 3. Context descriptor (index 0) */
 	struct e1000_adv_tx_context_desc *ctx = (struct e1000_adv_tx_context_desc *)&tx_ring[0];
 	memset(ctx, 0, sizeof(struct e1000_adv_tx_context_desc));
-	/* DEXT (29) | TSE (31) | DTYP (20) */
-	ctx->type_tucmd_mlhl = cpu_to_le32(0x20000000 | 0x80000000 | 0x00100000);
-	/* MSS (16-31) = 1500, L4LEN (8-15) = 20, IDX (0-7) = 0 */
-	ctx->mss_l4len_idx = cpu_to_le32((1500 << 16) | (20 << 8) | 0);
+	ctx->type_tucmd_mlhl = cpu_to_le32(CTX_DEXT | CTX_TSE | CTX_DTYP);
+	ctx->mss_l4len_idx = cpu_to_le32(CTX_MSS(1500) | CTX_L4LEN(20));
 
 	/* 4. Data descriptors */
 	for (i = 1; i < nents + 1; i++) {
-		u32 flags = 0x20000000 | 0x00100000 | 0x80000000; // DEXT | DTYP_D | TSE
+		u32 flags = DATA_DEXT | DATA_DTYP_D | DATA_TSE;
 
 		/* First packet needs IFCS */
 		if (i == 1) {
-			flags |= 0x02000000; // IFCS
+			flags |= DATA_IFCS;
 		}
 		/* Last descriptor needs EOP and RS */
 		if (i == nents) {
-			flags |= 0x01000000; // EOP
-			flags |= 0x08000000; // RS
+			flags |= DATA_EOP | DATA_RS;
 		}
 
 		tx_ring[i].buffer_addr = cpu_to_le64(sg_dma_address(&sg_list[i - 1]));
@@ -491,13 +547,10 @@ static int sg_transfer(size_t size)
 	iowrite32(nents + 1, DMADRIVER_PCI_FIELD(DMADRIVER_TDT));
 
 	/* 6. Wait for completion */
-	while (ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TDH)) != (nents + 1)) {
-		if ((--timeout) == 0) {
-			printk(KERN_ERR "dmadriver: Extended SG timeout!\n");
-			ret = -EIO;
-			goto clean_all;
-		}
-		cpu_relax();
+	ret = wait_for_tdh(nents + 1);
+	if (ret) {
+		printk(KERN_ERR "dmadriver: Extended SG timeout!\n");
+		goto clean_all;
 	}
 
 	/* 7. Success */
@@ -507,38 +560,52 @@ clean_all:
 	dma_unmap_sg(&nc_dev->dev, sg_list, nents, DMA_TO_DEVICE);
 	return ret;
 }
+
+/* Enables the transmitter and configures padding for short packets */
+static void netcard_enable_transmitter(void)
+{
+    u32 tctl = ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TCTL));
+    ENABLE_EN(tctl);
+    ENABLE_PSP(tctl);
+    iowrite32(tctl, DMADRIVER_PCI_FIELD(DMADRIVER_TCTL));
+}
+
+/* Disables the transmitter (used before unmapping memory) */
+static void netcard_disable_transmitter(void)
+{
+    u32 tctl = ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TCTL));
+    tctl &= ~TCTL_EN_BIT;
+    iowrite32(tctl, DMADRIVER_PCI_FIELD(DMADRIVER_TCTL));
+}
+
 static int dmadriver_configure_netcard(dma_addr_t ring_dma, u32 desc_count)
 {
   /* Reset the netcard to clear any previous state */
-  u32 ctrl = ioread32(DMADRIVER_PCI_FIELD(0x0000));
-  iowrite32(ctrl | (1 << 26), DMADRIVER_PCI_FIELD(0x0000));
+  u32 ctrl = ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_CTRL));
+  iowrite32(ctrl | CTRL_RST, DMADRIVER_PCI_FIELD(DMADRIVER_CTRL));
   /* Wait for reset to complete (usually takes a few microseconds) */
   mdelay(1);
+  
   /* Enable transmitter and configure padding */
-  u32 tctl = ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TCTL));
-  printk(KERN_INFO "dmadriver: old tctl is 0x%x\n", tctl);
-  ENABLE_EN(tctl);
-  ENABLE_PSP(tctl);
-  printk(KERN_INFO "dmadriver: new tctl is 0x%x\n", tctl);
-  iowrite32(tctl, DMADRIVER_PCI_FIELD(DMADRIVER_TCTL));
+  printk(KERN_INFO "dmadriver: old tctl is 0x%x\n", ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TCTL)));
+  netcard_enable_transmitter();
+  printk(KERN_INFO "dmadriver: new tctl is 0x%x\n", ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TCTL)));
+  
   /* Configure inter packet gap
    * with default linux value */
   iowrite32(TIPG_DEFAULT, DMADRIVER_PCI_FIELD(DMADRIVER_TIPG));
-  // int err = ring_buffer_memory_allocate();
-  // if (err) {
 
-  // 	return err;
-  // }
   /* Configure tx buffer parameters */
-
   /* Copy lower part of physical address */
   iowrite32((u32)ring_dma, DMADRIVER_PCI_FIELD(DMADRIVER_TDBAL));
   u32 data = ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TDBAL));
   printk(KERN_INFO "dmadriver: new tdbal is 0x%x\n", data);
+  
   /* Copy higher part of physical address */
   iowrite32((u32)(ring_dma >> 32), DMADRIVER_PCI_FIELD(DMADRIVER_TDBAH));
   data = ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TDBAH));
   printk(KERN_INFO "dmadriver: new tdbah is 0x%x\n", data);
+  
   /* Set ring buffer size.
    * It should be muliple of 128 bytes,
    * so with TX_RING_SIZE = 8 and
@@ -712,6 +779,7 @@ static int __init dmadriver_init(void)
   /* Read netcard inital status */
   u32 status = ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_PCI_STATUS));
   printk(KERN_INFO "dmadriver: old PCI netcard status is 0x%x\n", status);
+  
   err = ring_buffer_memory_allocate();
   if (err)
     return err;
@@ -719,9 +787,7 @@ static int __init dmadriver_init(void)
   err = dmadriver_configure_netcard(tx_ring_dma, TX_RING_SIZE);
   if (err)
     return err;
-  // if (alloc_mode == 2) {
-  //   sg_transfer((1UL << 24));
-  // }
+
   status = ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_PCI_STATUS));
   printk(KERN_INFO "dmadriver: new PCI netcard status is 0x%x\n", status);
   printk(KERN_INFO "dmadriver: Driver mounted\n");
@@ -733,9 +799,7 @@ static void __exit dmadriver_exit(void)
   printk(KERN_INFO "dmadriver: Driver unmounting\n");
 
   /* 1. Disable transmitter BEFORE touching memory and registers */
-  u32 tctl = ioread32(DMADRIVER_PCI_FIELD(DMADRIVER_TCTL));
-  tctl &= ~(1 << 1); // Clear EN bit
-  iowrite32(tctl, DMADRIVER_PCI_FIELD(DMADRIVER_TCTL));
+  netcard_disable_transmitter();
 
   /* 2. Reset ring pointers to initial state */
   iowrite32(0, DMADRIVER_PCI_FIELD(DMADRIVER_TDH));
@@ -745,38 +809,7 @@ static void __exit dmadriver_exit(void)
   msleep(10);
 
   /* 4. Now it's safe to free memory */
-  if (alloc_mode == 0)
-  {
-    dma_free_coherent(&nc_dev->dev, buffer_size, tx_buffer, tx_buffer_dma);
-    dma_free_coherent(&nc_dev->dev, TX_RING_SIZE * sizeof(struct e1000_tx_desc), tx_ring, tx_ring_dma);
-  }
-  else if (alloc_mode == 1)
-  {
-    dma_unmap_single(&nc_dev->dev, tx_buffer_dma, buffer_size, DMA_TO_DEVICE);
-    kfree(tx_buffer);
-    dma_unmap_single(&nc_dev->dev, tx_ring_dma, TX_RING_SIZE * sizeof(struct e1000_tx_desc), DMA_TO_DEVICE);
-    kfree(tx_ring);
-  }
-  else if (alloc_mode == 2)
-  {
-    if (sg_bufs)
-    {
-      for (int i = 0; i < DMADRIVER_SG_MAX_SEGMENTS; i++)
-      {
-        if (sg_bufs[i])
-          kfree(sg_bufs[i]);
-      }
-      kfree(sg_bufs);
-    }
-    if (sg_list)
-    {
-      kfree(sg_list);
-    }
-    if (tx_ring)
-    {
-      dma_free_coherent(&nc_dev->dev, TX_RING_SIZE * sizeof(struct e1000_tx_desc), tx_ring, tx_ring_dma);
-    }
-  }
+  ring_buffer_memory_free();
 
   /* 5. Unmap registers */
   pci_iounmap(nc_dev, nc_base);
