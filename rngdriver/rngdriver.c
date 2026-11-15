@@ -9,8 +9,7 @@
 #include <linux/wait.h>
 #include <linux/slab.h>
 #include <linux/fcntl.h>
-#include <asm/archrandom.h>
-#include <asm/cpufeature.h>
+#include <linux/random.h>
 #include "rng_ioctl.h"
 
 #define MAX_POOL 8192
@@ -53,24 +52,12 @@ static struct file_operations fops = {
 
 static ssize_t get_rand(u8 *buf, size_t size)
 {
-  size_t copied = 0;
-
-  if (!boot_cpu_has(X86_FEATURE_RDRAND))
-    return -ENODEV;
-
-  while (copied < size)
-  {
-    unsigned long val;
-    size_t chunk;
-
-    if (!rdrand_long(&val))
-      return -EIO;
-
-    chunk = min(size - copied, sizeof(val));
-    memcpy(buf + copied, &val, chunk);
-    copied += chunk;
-  }
-  return copied;
+  /* 
+   * На RISC-V нет RDRAND. Используем стандартный API ядра,
+   * который на RISC-V автоматически берет энтропию из virtio-rng.
+   */
+  get_random_bytes(buf, size);
+  return size;
 }
 
 static int __init rng_init(void)
