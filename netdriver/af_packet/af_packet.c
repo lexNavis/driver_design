@@ -289,7 +289,7 @@ int main()
   maybe_reload_map(); 
 
   /* Слушаем сразу два интерфейса: внешний и loopback (для локальных тестов) */
-  const char *ifaces[] = { "enp0s3", "lo" };
+  const char *ifaces[] = { "eth0", "lo" };
   const int iface_count = 2;
 
   int sds[MAX_SOCKETS];
