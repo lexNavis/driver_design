@@ -7,307 +7,237 @@
 #include <linux/seq_file.h>
 #include <linux/workqueue.h>
 #include <linux/delay.h>
-#include <linux/pci.h>
-#include <linux/io.h>
-#include <linux/ktime.h> // Для работы с ktime_t
+#include <linux/ktime.h> /* For ktime_t */
 
-#define CLOCK_INTERVAL 100000000
+/* Default interval: 100 ms */
+static unsigned int interval_ms = 100;
+module_param(interval_ms, uint, 0644);
+MODULE_PARM_DESC(interval_ms, "Default timer interval in milliseconds");
 
-/* Offsets for edu registers */
-#define EDU_REG_RAISE_IRQ	0x60
-#define EDU_REG_ACK_IRQ		0x64
-#define EDU_REG_IRQ_STATUS	0x24
-
-/* To distinguish irq source, 
- * create structs for tasklet and workqueue */
+/* Structure to hold tasklet data and timing */
 static struct irq_tasklet_data {
-	struct tasklet_struct tasklet;
-	/* 0 - timer, 1 - edu */
-	int src;	
-	/* Time measurement */
-	ktime_t start_time;
-	u64 total_lag;
-}tasklet_data;
+    struct tasklet_struct tasklet;
+    ktime_t start_time;
+    u64 total_lag;
+} tasklet_data;
 
+/* Structure to hold workqueue data and timing */
 static struct irq_workqueue_data {
-	struct work_struct work;
-	int src;	
-	/* Time measurement */
-	ktime_t start_time;
-	u64 total_lag;
-}workqueue_data;
+    struct work_struct work;
+    ktime_t start_time;
+    u64 total_lag;
+} workqueue_data;
 
-/* Thread time measurement */
-static ktime_t thread_start_time;
-static u64 thread_total_lag = 0;
-
-/* Counters. Save information, how many
- * interrupts have entered top-half and bottom-half
+/* 
+ * Timing metrics for the timer itself.
+ * timer_total_lag accumulates the jitter (difference between 
+ * scheduled and actual firing time).
  */
-/* hrtimer irqs */
+static u64 timer_total_lag = 0;
+static ktime_t last_actual_time;
+
+/* Counters for bottom-halves and timer */
 static atomic_t timer_count = ATOMIC_INIT(0);
-/* edu irqs */
-static atomic_t edu_count = ATOMIC_INIT(0);
-/* tasklet irqs*/
 static atomic_t timer_tasklet_count = ATOMIC_INIT(0);
-static atomic_t edu_tasklet_count = ATOMIC_INIT(0);
-/* workqueue irqs */
 static atomic_t timer_workqueue_count = ATOMIC_INIT(0);
-static atomic_t edu_workqueue_count = ATOMIC_INIT(0);
-/* threaded_irqs */
-static atomic_t threaded_irq_count = ATOMIC_INIT(0);
-/* Pointer to start of edu register data */
-static void __iomem *edu_base = NULL;
-/* Ptr to PCI edu device */
-static struct pci_dev *edu_dev = NULL; 
-/* Pointer to file in /proc directory */
-struct proc_dir_entry *proc;
-/* Create a timer var */
+static atomic_t log_count = ATOMIC_INIT(0); /* To limit dmesg spam */
+
+/* Pointer to /proc entry */
+static struct proc_dir_entry *proc;
+
+/* High-resolution timer */
 static struct hrtimer gtimer;
+
+/* Expected time of the next timer expiry */
+static ktime_t next_expiry;
+
 /* Stats function */
 static int show_stats(struct seq_file *file, void *);
-/* Dev irq handlers */
-/* Top half */
-static irqreturn_t edu_irq_top_half(int irq, void *dev_id);
-/* Bottom half */
-static irqreturn_t edu_irq_thread(int irq, void *dev_id);
-/* Callbacks definition */
+
+/* Callbacks */
 static void timer_tasklet_callback(unsigned long);
 static void timer_workqueue_callback(struct work_struct *work);
 static enum hrtimer_restart timer_callback(struct hrtimer *timer);
+
 /* Driver operations */
 static ssize_t irqdriver_proc_write(struct file *filp, const char __user *buf, size_t size, loff_t *);
 static int irqdriver_proc_open(struct inode *inode, struct file *filp);
-/* Create proc_ops */
+
 static struct proc_ops ops = {
-	.proc_open = irqdriver_proc_open,
-	.proc_read = seq_read,
-	.proc_lseek = seq_lseek,
-	.proc_release = single_release,
-	.proc_write	= irqdriver_proc_write,
+    .proc_open = irqdriver_proc_open,
+    .proc_read = seq_read,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+    .proc_write = irqdriver_proc_write,
 };
 
 static int __init irqdriver_init(void)
 {
-	printk(KERN_INFO "irqdriver: Module mounted!\n");
-	/* Assign ptr to an opened file
-	 * 0 stands for 0666 - read-write to everyone
-	 * Create file in root dir, so parent is NULL */
-	proc = proc_create("irqdriver", 0666, NULL, &ops);
-	if (!proc) {
-		printk(KERN_ERR "irqdriver: proc_create failed, returned NULL\n");
-		return -ENOMEM;
-	}
-	/* Find PCI device and its IRQ number by
-	 * Vendor ID and Device ID
-	 * NULL says start from the beginning of dev list */
-	edu_dev = pci_get_device(0x1234, 0x11e8, NULL);
-	if (!edu_dev){
-		printk(KERN_ERR "irqdriver: edu device not found, returned NULL\n");		
-		return -ENODEV;
-	}
-	/* Turn it on */
-	if (pci_enable_device(edu_dev)){
-		printk(KERN_ERR "irqdriver: failed to enable PCI device\n");
-		return -EIO;
-	}
-	/* Get pointer to edu regs
-	 * 0 - BAR0 (Base Address Register) 
-	 * 0 - size by default */
-	edu_base = pci_iomap(edu_dev, 0, 0);
-	if (!edu_base) {
-		printk(KERN_ERR "irqdriver: pci_iomap failed to get virtual address\n");		
-		pci_dev_put(edu_dev);
-		return -ENOMEM;
-	}
-	/* Register irq handler */
-	int err = request_threaded_irq(edu_dev->irq, edu_irq_top_half, edu_irq_thread, IRQF_SHARED, "irqdriver", edu_dev);
-	if (err){
-		printk(KERN_ERR "irqdriver: failed to request irq\n");			
-		pci_iounmap(edu_dev, edu_base);
-		pci_dev_put(edu_dev);		
-		return err;
-	}
-	/* Initialize global variables */
-	tasklet_init(&tasklet_data.tasklet, timer_tasklet_callback, (unsigned long)&tasklet_data);
-	INIT_WORK(&workqueue_data.work, timer_workqueue_callback);
-	hrtimer_init(&gtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	/* Register top-half callback */
-	gtimer.function = timer_callback;
-	hrtimer_start(&gtimer, ktime_set(0, CLOCK_INTERVAL), HRTIMER_MODE_REL);
-	return 0;
+    ktime_t interval;
+
+    printk(KERN_INFO "irqdriver: Module mounted with interval %u ms\n", interval_ms);
+
+    proc = proc_create("irqdriver", 0666, NULL, &ops);
+    if (!proc) {
+        printk(KERN_ERR "irqdriver: proc_create failed, returned NULL\n");
+        return -ENOMEM;
+    }
+
+    /* Initialize tasklet and workqueue */
+    tasklet_init(&tasklet_data.tasklet, timer_tasklet_callback, (unsigned long)&tasklet_data);
+    INIT_WORK(&workqueue_data.work, timer_workqueue_callback);
+
+    /* Setup hrtimer using the new API (hrtimer_setup) */
+    hrtimer_setup(&gtimer, timer_callback, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+
+    interval = ktime_set(0, interval_ms * 1000000ULL); /* Convert ms to ns */
+    next_expiry = ktime_add(ktime_get(), interval);
+    hrtimer_start(&gtimer, interval, HRTIMER_MODE_REL);
+
+    return 0;
 }
+
 static void __exit irqdriver_exit(void)
 {
-	printk(KERN_INFO "irqdriver: Module unmounted!\n");
-	/* Stop timer */
-	hrtimer_cancel(&gtimer);
-	/* Free tasklet */
-	tasklet_kill(&tasklet_data.tasklet);
-	/* Free workqueue */
-	cancel_work_sync(&workqueue_data.work);
-	/* Delete /proc file */
-	remove_proc_entry("irqdriver", NULL);
-	free_irq(edu_dev->irq, edu_dev);
-	/* Free virtual memory */
-	pci_iounmap(edu_dev, edu_base);
-	/* Remove edu */
-	pci_dev_put(edu_dev);
+    printk(KERN_INFO "irqdriver: Module unmounted!\n");
+
+    hrtimer_cancel(&gtimer);
+    tasklet_kill(&tasklet_data.tasklet);
+    cancel_work_sync(&workqueue_data.work);
+
+    remove_proc_entry("irqdriver", NULL);
 }
+
 /* Prints statistics of handled soft/hardirqs */
-int show_stats(struct seq_file *file, void *) {
-	seq_printf(file, "------HARDIRQS------\n");
-	seq_printf(file, "hrtimer handled %d irqs\n", atomic_read(&timer_count));
-	seq_printf(file, "edu handled %d irqs\n", atomic_read(&edu_count));
-	seq_printf(file, "------SOFTIRQS------\n");
-	
-	int t_count = atomic_read(&timer_tasklet_count);
-	int e_count = atomic_read(&edu_tasklet_count);
-	seq_printf(file, "tasklet handled %d irqs from timer\n", t_count);
-	seq_printf(file, "tasklet handled %d irqs from edu\n", e_count);
-	/* Average lag in nanoseconds */
-	u64 avg_t_lag = t_count ? (tasklet_data.total_lag / t_count) : 0;
-	seq_printf(file, "tasklet avg lag: %llu ns\n", avg_t_lag);
+int show_stats(struct seq_file *file, void *)
+{
+    int t_count = atomic_read(&timer_tasklet_count);
+    int w_count = atomic_read(&timer_workqueue_count);
+    int timer_c = atomic_read(&timer_count);
 
-	int wt_count = atomic_read(&timer_workqueue_count);
-	int we_count = atomic_read(&edu_workqueue_count);
-	seq_printf(file, "workqueue handled %d irqs from timer\n", wt_count);
-	seq_printf(file, "workqueue handled %d irqs from edu\n", we_count);
-	u64 avg_w_lag = wt_count ? (workqueue_data.total_lag / wt_count) : 0;
-	seq_printf(file, "workqueue avg lag: %llu ns\n", avg_w_lag);
+    u64 avg_t_lag = t_count ? (tasklet_data.total_lag / t_count) : 0;
+    u64 avg_w_lag = w_count ? (workqueue_data.total_lag / w_count) : 0;
+    u64 avg_timer_lag = timer_c ? (timer_total_lag / timer_c) : 0;
 
-	int th_count = atomic_read(&threaded_irq_count);
-	seq_printf(file, "threaded_irq handled %d irqs\n", th_count);
-	u64 avg_th_lag = th_count ? (thread_total_lag / th_count) : 0;
-	seq_printf(file, "threaded_irq avg lag: %llu ns\n", avg_th_lag);
-	
-	return 0;
+    seq_printf(file, "------ CONFIGURATION ------\n");
+    seq_printf(file, "Configured interval: %u ms\n", interval_ms);
+
+    seq_printf(file, "------ TIMER (HARDIRQ) ------\n");
+    seq_printf(file, "Timer fired: %d times\n", timer_c);
+    seq_printf(file, "Timer avg jitter: %llu ns\n", avg_timer_lag);
+    seq_printf(file, "Last actual time: %lld ns\n", ktime_to_ns(last_actual_time));
+
+    seq_printf(file, "------ TASKLET (SOFTIRQ) ------\n");
+    seq_printf(file, "Tasklet handled: %d times\n", t_count);
+    seq_printf(file, "Tasklet avg lag: %llu ns\n", avg_t_lag);
+
+    seq_printf(file, "------ WORKQUEUE (PROCESS CONTEXT) ------\n");
+    seq_printf(file, "Workqueue handled: %d times\n", w_count);
+    seq_printf(file, "Workqueue avg lag: %llu ns\n", avg_w_lag);
+
+    return 0;
 }
 
 void timer_workqueue_callback(struct work_struct *work)
 {
-	/* We are not in irq context, so
-	 * sleeping is allowed */
-	/* We should check the irq source and inc
-	 * the following counter */
-	struct irq_workqueue_data *w_data = container_of(work, struct irq_workqueue_data, work);
-	if (!w_data) {
-		return;
-	}
-	/* Calculate lag */
-	u64 lag = ktime_to_ns(ktime_sub(ktime_get(), w_data->start_time));
-	w_data->total_lag += lag;
-	
-	if (w_data->src)
-		atomic_inc(&edu_workqueue_count);
-	else
-		atomic_inc(&timer_workqueue_count);
-}
+    /* We are not in irq context, so sleeping is allowed */
+    struct irq_workqueue_data *w_data = container_of(work, struct irq_workqueue_data, work);
+    if (!w_data) {
+        return;
+    }
 
+    /* Calculate lag from the moment the bottom-half was scheduled */
+    u64 lag = ktime_to_ns(ktime_sub(ktime_get(), w_data->start_time));
+    w_data->total_lag += lag;
+
+    atomic_inc(&timer_workqueue_count);
+}
 
 void timer_tasklet_callback(unsigned long data)
 {
-	/* msleep test. tasklet works in irq context,
-	 * so we mustnt sleep here. */
-	struct irq_tasklet_data *t_data = (struct irq_tasklet_data *)data;
-	/* We should check the irq source and inc
-	 * the following counter */
-	if (!t_data) {
-		return;
-	}
-	/* Calculate lag */
-	u64 lag = ktime_to_ns(ktime_sub(ktime_get(), t_data->start_time));
-	t_data->total_lag += lag;
-	
-	if (t_data->src)
-		atomic_inc(&edu_tasklet_count);	
-	else
-		atomic_inc(&timer_tasklet_count);		
+    /* Tasklet works in irq context, so we mustn't sleep here. */
+    struct irq_tasklet_data *t_data = (struct irq_tasklet_data *)data;
+    if (!t_data) {
+        return;
+    }
+
+    /* Calculate lag from the moment the bottom-half was scheduled */
+    u64 lag = ktime_to_ns(ktime_sub(ktime_get(), t_data->start_time));
+    t_data->total_lag += lag;
+
+    atomic_inc(&timer_tasklet_count);
 }
 
 enum hrtimer_restart timer_callback(struct hrtimer *timer)
 {
-	/* Irqs are already forbidden, so
-	 * no need to use local_irq_save() */
-	/* New irq from timer has come */
-	atomic_inc(&timer_count);
-	/* Replan the timer */
-	hrtimer_forward(timer, ktime_get(), ktime_set(0, CLOCK_INTERVAL));
-	
-	/* Save start time before scheduling */
-	tasklet_data.start_time = ktime_get();
-	workqueue_data.start_time = ktime_get();
-	
-	/* Plan tasklet */
-	tasklet_data.src = 0;
-	tasklet_schedule(&tasklet_data.tasklet);
-	/* Plan workqueue
-	 * Add gwork to list of planned actions */
-	workqueue_data.src = 0;
-	queue_work(system_wq, &workqueue_data.work);
-	return HRTIMER_RESTART;
-}
+    ktime_t now = ktime_get();
+    ktime_t interval = ktime_set(0, interval_ms * 1000000ULL);
+    s64 timer_jitter;
 
-irqreturn_t edu_irq_top_half(int irq, void *dev_id)
-{
-	/* Edu is a PCI device, so dev_id should be pci_dev */
-		
-	/* Check if irq has come from edu, because irq is shared */
-	u32 status = ioread32(edu_base + EDU_REG_IRQ_STATUS);
-	/* If its not edu, leave handler */
-	if (status == 0){
-		return IRQ_NONE;
-	}
-	/* Accept irq */
-	iowrite32(status, edu_base + EDU_REG_ACK_IRQ);
-	atomic_inc(&edu_count);
-	
-	/* Save start time before scheduling */
-	tasklet_data.start_time = ktime_get();
-	workqueue_data.start_time = ktime_get();
-	thread_start_time = ktime_get();
-	
-	/* Plan bottom-half */
-	tasklet_data.src = 1;
-	tasklet_schedule(&tasklet_data.tasklet);
-	workqueue_data.src = 1;
-	queue_work(system_wq, &workqueue_data.work);
-	return IRQ_WAKE_THREAD;	
-}
-irqreturn_t edu_irq_thread(int irq, void *dev_id)
-{
-	u64 lag = ktime_to_ns(ktime_sub(ktime_get(), thread_start_time));
-	thread_total_lag += lag;
-	
-	atomic_inc(&threaded_irq_count);
-	/* Irq complete */
-	return IRQ_HANDLED;
+    /* Save actual time for the /proc stats */
+    last_actual_time = now;
+
+    /* Increment hardirq counter */
+    atomic_inc(&timer_count);
+
+    /* Calculate jitter for the timer itself (how late it fired) */
+    timer_jitter = ktime_to_ns(ktime_sub(now, next_expiry));
+    if (timer_jitter > 0) {
+        timer_total_lag += timer_jitter;
+    }
+
+    /* Log the first 5 firings to dmesg (to avoid spam) */
+    if (atomic_read(&log_count) < 5) {
+        printk(KERN_INFO "irqdriver: Timer fired, jitter = %lld ns\n", timer_jitter);
+        atomic_inc(&log_count);
+    }
+
+    /* Schedule the next expiry */
+    next_expiry = ktime_add(next_expiry, interval);
+    hrtimer_forward(timer, now, interval);
+
+    /* Save start time before scheduling bottom-halves */
+    tasklet_data.start_time = now;
+    workqueue_data.start_time = now;
+
+    /* Schedule bottom halves */
+    tasklet_schedule(&tasklet_data.tasklet);
+    queue_work(system_wq, &workqueue_data.work);
+
+    return HRTIMER_RESTART;
 }
 
 int irqdriver_proc_open(struct inode *inode, struct file *filp)
 {
-	return single_open(filp, show_stats, NULL);
+    return single_open(filp, show_stats, NULL);
 }
 
 ssize_t irqdriver_proc_write(struct file *filp, const char __user *buf, size_t size, loff_t *)
 {
-	int val;
-	int err = kstrtoint_from_user(buf, size, 10, &val);
-	if (err) {
-		printk(KERN_ERR "irqdriver: kstrtoint_from_user failed\n");
-		return err;					
-	}
-	/* If user wants an irq */
-	if (val == 1) {
-		iowrite32(1, edu_base + EDU_REG_RAISE_IRQ);
-	}
-	return size;
-}
+    int val;
+    int err = kstrtoint_from_user(buf, size, 10, &val);
+    
+    if (err) {
+        printk(KERN_ERR "irqdriver: kstrtoint_from_user failed\n");
+        return err;
+    }
 
+    /* If user writes a valid interval, update it on the fly */
+    if (val > 0 && val <= 5000) {
+        interval_ms = val;
+        printk(KERN_INFO "irqdriver: Interval changed to %u ms\n", interval_ms);
+        
+        /* Re-schedule the timer immediately with new interval */
+        hrtimer_cancel(&gtimer);
+        next_expiry = ktime_add(ktime_get(), ktime_set(0, interval_ms * 1000000ULL));
+        hrtimer_start(&gtimer, ktime_set(0, interval_ms * 1000000ULL), HRTIMER_MODE_REL);
+    }
+    return size;
+}
 
 module_init(irqdriver_init);
 module_exit(irqdriver_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DENIS SHEIN");
-MODULE_DESCRIPTION("Different implementations of top-bottom halfs of interrupt handlers");
+MODULE_DESCRIPTION("Adapted timer-only driver for bottom-half comparison");
