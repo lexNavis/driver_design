@@ -75,22 +75,35 @@ static __always_inline struct stats *get_stats(const struct __sk_buff *skb)
   /* Разбор транспортного уровня */
   if (ip->protocol == IPPROTO_TCP)
   {
-    /* Смещение до TCP-заголовка: начало IP + длина IP-заголовка (ihl * 4) */
-    struct tcphdr *tcp = (struct tcphdr *)((void *)ip + ip->ihl * 4);
-    if ((void *)ip + ip->ihl * 4 + sizeof(struct tcphdr) > data_end)
-    {
-      return NULL;
-    }
+
+  	/* Явные проверки, чтобы БПФ не ругался */
+  	if (ip->ihl < 5 || ip->ihl > 15) {
+  		return NULL;
+  	}
+
+	/* Смещение до TCP-заголовка: начало IP + длина IP-заголовка (ihl * 4) */
+  	void *tcp_start = (void *)ip + (ip->ihl * 4);
+ 	if (tcp_start + sizeof(struct tcphdr) > data_end)
+ 	{
+ 		return NULL;
+	}
+    
+    struct tcphdr *tcp = tcp_start;
     sport = bpf_ntohs(tcp->source);
     dport = bpf_ntohs(tcp->dest);
   }
   else if (ip->protocol == IPPROTO_UDP)
   {
-    struct udphdr *udp = (struct udphdr *)((void *)ip + ip->ihl * 4);
-    if ((void *)ip + ip->ihl * 4 + sizeof(struct udphdr) > data_end)
-    {
-      return NULL;
-    }
+  	/* Явные проверки, чтобы БПФ не ругался */
+  	if (ip->ihl < 5 || ip->ihl > 15) {
+  		return NULL;
+  	}
+  	void *udp_start = (void *)ip + (ip->ihl * 4);
+ 	if (udp_start + sizeof(struct udphdr) > data_end)
+ 	{
+ 		return NULL;
+	}
+    struct udphdr *udp = udp_start;
     sport = bpf_ntohs(udp->source);
     dport = bpf_ntohs(udp->dest);
   }
