@@ -28,4 +28,5 @@ logs/
 .*
 !.gitignore
 !.gitattributes
+!af_packet/
 
