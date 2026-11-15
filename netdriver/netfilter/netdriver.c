@@ -133,9 +133,9 @@ static pid_t netdriver_get_pid(const struct sk_buff *skb)
 {
   pid_t pid;
   struct sock *sk = skb->sk;
-  if (sk && sk->sk_socket && sk->sk_socket->file && sk->sk_socket->file->f_owner.pid)
+  if (sk && sk->sk_socket && sk->sk_socket->file && sk->sk_socket->file->f_owner && sk->sk_socket->file->f_owner->pid)
   {
-    pid = pid_vnr(sk->sk_socket->file->f_owner.pid);
+    pid = pid_vnr(sk->sk_socket->file->f_owner->pid);
     if (pid)
     {
       return pid;
