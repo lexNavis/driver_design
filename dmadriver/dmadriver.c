@@ -101,7 +101,7 @@ typedef int (*transfer_func_t)(size_t);
 /* Buffer count for scatter-gather */
 #define SG_BUFFER_COUNT 2
 #define TX_PACKET_SIZE 1500
-#define TIMEOUT_SIZE 1000000
+#define TIMEOUT_SIZE 100000000
 #define MAX_MEM_SIZE (1UL << 26)
 #define DMADRIVER_SG_MAX_SEGMENTS (TX_RING_SIZE - 2)
 

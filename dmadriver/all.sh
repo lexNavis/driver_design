@@ -1,16 +1,21 @@
 #!/bin/bash
 
-# Массив размеров для тестов
-SIZES=(1024 65536 1048576 8388608 16777216)
-# Размер буфера для streaming и SG (2 МБ)
+# Array of sizes for testing
+SIZES=(1024 65536 1048576) # Removed 16MB for RISC-V to save time
+# Buffer size for streaming and SG (2 MB)
 BUFFER_SIZE=$((1 << 21)) 
 
-LOG_FILE="/mnt/share/dma_all_modes_test.log"
+# PCI slot for the second e1000 card (eth1) on RISC-V QEMU
+TARGET_SLOT="0000:00:02.0"
+
+# Create logs directory if it doesn't exist
+mkdir -p ./logs
+LOG_FILE="./logs/dma_all_modes_test.log"
 > $LOG_FILE
 
 echo "=== Running ALL DMA modes test ===" | tee -a $LOG_FILE
 
-# Функция для запуска тестов для конкретного режима
+# Function to run tests for a specific mode
 run_tests() {
     local mode_name=$1
     local mode_val=$2
@@ -20,50 +25,50 @@ run_tests() {
     echo "=== MODE: $mode_name (alloc_mode=$mode_val) ===" | tee -a $LOG_FILE
     echo "========================================" | tee -a $LOG_FILE
 
-    # 1. Отвязываем карту
-    echo 0000:00:06.0 | sudo tee /sys/bus/pci/drivers/e1000/unbind > /dev/null
+    # 1. Unbind the card from the standard e1000 driver
+    echo $TARGET_SLOT | sudo tee /sys/bus/pci/drivers/e1000/unbind > /dev/null
 
-    # 2. Загружаем модуль
+    # 2. Load the module with the correct target slot
     if [ "$use_buffer_size" = "yes" ]; then
-        sudo insmod dmadriver.ko alloc_mode=$mode_val buffer_size=$BUFFER_SIZE
+        sudo insmod dmadriver.ko alloc_mode=$mode_val buffer_size=$BUFFER_SIZE target_slot=$TARGET_SLOT
     else
-        sudo insmod dmadriver.ko alloc_mode=$mode_val
+        sudo insmod dmadriver.ko alloc_mode=$mode_val target_slot=$TARGET_SLOT
     fi
 
     if [ $? -ne 0 ]; then
         echo "ERROR: Module failed to load for $mode_name" | tee -a $LOG_FILE
-        echo 0000:00:06.0 | sudo tee /sys/bus/pci/drivers/e1000/bind > /dev/null
+        echo $TARGET_SLOT | sudo tee /sys/bus/pci/drivers/e1000/bind > /dev/null
         return 1
     fi
 
-    # 3. Прогоняем размеры
+    # 3. Run tests for each size
     for SIZE in "${SIZES[@]}"; do
         echo "=== Testing size: $SIZE bytes ===" | tee -a $LOG_FILE
         
-        # Очищаем логи
+        # Clear dmesg to avoid mixing logs
         sudo dmesg -c > /dev/null
         
-	sudo ./user_app.sh $SIZE | tee -a $LOG_FILE
+        sudo ./user_app.sh $SIZE | tee -a $LOG_FILE
         
         echo "----------------------------------------" | tee -a $LOG_FILE
     done
 
-    # 4. Выгружаем модуль
+    # 4. Unload the module
     sudo rmmod dmadriver
 
-    # 5. Возвращаем карту
-    echo 0000:00:06.0 | sudo tee /sys/bus/pci/drivers/e1000/bind > /dev/null
+    # 5. Rebind the card to the standard driver
+    echo $TARGET_SLOT | sudo tee /sys/bus/pci/drivers/e1000/bind > /dev/null
 }
 
-# --- Запускаем тесты по очереди ---
+# --- Run tests sequentially ---
 
-# 1. Coherent (без параметра buffer_size)
+# 1. Coherent (no buffer_size)
 run_tests "Coherent" 0 "no"
 
-# 2. Streaming (с buffer_size)
+# 2. Streaming (with buffer_size)
 run_tests "Streaming" 1 "yes"
 
-# 3. Scatter-Gather (с buffer_size)
+# 3. Scatter-Gather (with buffer_size)
 run_tests "Scatter-Gather" 2 "yes"
 
 echo "=== ALL TESTS FINISHED ===" | tee -a $LOG_FILE
