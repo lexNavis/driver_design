@@ -17,11 +17,7 @@ DEVICE="/dev/rngdriver"
 TEST_BIN="rng_test"
 
 cd "$DIR"
-
-echo "=== 1. Сборка модуля ==="
-make
-
-echo "=== 2. Выгрузка старого модуля ==="
+echo "=== 1. Выгрузка старого модуля ==="
 if lsmod | grep -q "^${MODULE} "; then
     # убить процессы, которые держат устройство
     if command -v fuser >/dev/null 2>&1; then
@@ -34,7 +30,7 @@ else
     echo "  Модуль не был загружен"
 fi
 
-echo "=== 3. Загрузка модуля ==="
+echo "=== 2. Загрузка модуля ==="
 insmod "${MODULE}.ko"
 sleep 0.2
 if [ ! -e "$DEVICE" ]; then
@@ -44,13 +40,13 @@ if [ ! -e "$DEVICE" ]; then
 fi
 echo "  $DEVICE готов"
 
-echo "=== 4. Сборка user-программы ==="
+echo "=== 3. Сборка user-программы ==="
 gcc -Wall -O2 -o "$TEST_BIN" rng_test.c
 
-echo "=== 5. Запуск тестов ==="
+echo "=== 4. Запуск тестов ==="
 "./$TEST_BIN"
 
-echo "=== 6. Выгрузка модуля ==="
+echo "=== 5. Выгрузка модуля ==="
 if command -v fuser >/dev/null 2>&1; then
     fuser -k "$DEVICE" 2>/dev/null || true
     sleep 0.3

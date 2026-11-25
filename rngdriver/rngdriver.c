@@ -52,12 +52,11 @@ static struct file_operations fops = {
 
 static ssize_t get_rand(u8 *buf, size_t size)
 {
-  /* 
-   * На RISC-V нет RDRAND. Используем стандартный API ядра,
-   * который на RISC-V автоматически берет энтропию из virtio-rng.
-   */
-  get_random_bytes(buf, size);
-  return size;
+	/* Здесь нет RDRAND, а чтение из /dev/hwrng запрещено, поэтому
+	 * пользуемся стандартной функцией для получения энтропии. 
+	 * Здесь собрана вся энтропия, но из hwrng тоже есть. */
+	get_random_bytes(buf, size);
+	return size;
 }
 
 static int __init rng_init(void)

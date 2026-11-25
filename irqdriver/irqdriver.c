@@ -141,6 +141,7 @@ int show_stats(struct seq_file *file, void *)
 void timer_workqueue_callback(struct work_struct *work)
 {
     /* We are not in irq context, so sleeping is allowed */
+    msleep(100);
     struct irq_workqueue_data *w_data = container_of(work, struct irq_workqueue_data, work);
     if (!w_data) {
         return;

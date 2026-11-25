@@ -133,12 +133,14 @@ static pid_t netdriver_get_pid(const struct sk_buff *skb)
 {
   pid_t pid;
   struct sock *sk = skb->sk;
-  if (sk && sk->sk_socket && sk->sk_socket->file && sk->sk_socket->file->f_owner && sk->sk_socket->file->f_owner->pid)
+  if (sk && sk->sk_socket && sk->sk_socket->file)
   {
-    pid = pid_vnr(sk->sk_socket->file->f_owner->pid);
-    if (pid)
+    // В новом ядре f_owner - это указатель. Проверяем его на NULL.
+    struct fown_struct *fown = sk->sk_socket->file->f_owner;
+    if (fown && fown->pid)
     {
-      return pid;
+      pid = pid_vnr(fown->pid);
+      if (pid) return pid;
     }
   }
   return current->pid;

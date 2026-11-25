@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Array of sizes for testing
-SIZES=(1024 65536 1048576) # Removed 16MB for RISC-V to save time
+SIZES=(1024 65536 1048576 16777216) # Removed 16MB for RISC-V to save time
 # Buffer size for streaming and SG (2 MB)
 BUFFER_SIZE=$((1 << 21)) 
 
